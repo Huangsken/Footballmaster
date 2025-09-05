@@ -5,7 +5,7 @@ from common.normalizer import normalize
 from common.factors import evaluate_factors
 from common.importance import score as importance_score
 from common.causal import causal_snapshot
-from common.notify import tg_send, build_digest
+from common.notify import tg_send   # ✅ 只保留 tg_send
 
 from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
@@ -89,6 +89,38 @@ def _auth_or_403(token: Optional[str]):
         return
     if (token or "").strip() != secret:
         raise HTTPException(status_code=403, detail="forbidden")
+
+# =========================
+# 简单文本摘要（供通知）
+# =========================
+def _build_digest(overall: str, results: List[dict], run_id: str | None, dry_run: bool) -> str:
+    n = len(results)
+    n_acc = sum(1 for r in results if r.get("status") == "accepted")
+    n_warn = sum(1 for r in results if r.get("status") == "warn")
+    n_blk = sum(1 for r in results if r.get("status") == "block")
+    head = [
+        "Ingest Digest",
+        f"overall={overall}  dry_run={str(dry_run).lower()}  run_id={run_id or 'manual'}",
+        f"items={n}  accepted={n_acc}  warn={n_warn}  block={n_blk}",
+    ]
+    # 选一个代表样本
+    rep = None
+    for r in results:
+        imp = (r.get("importance") or {})
+        if imp.get("priority") == 1:
+            rep = r; break
+    if rep is None and results:
+        rep = results[0]
+    if rep:
+        imp = rep.get("importance") or {}
+        causal = rep.get("causal") or {}
+        lines = [
+            f"sample={rep.get('entity_id')} | {rep.get('schema')}",
+            f"importance: tier={imp.get('tier')} priority={imp.get('priority')}",
+            f"causal: adjusted_error≈{causal.get('adjusted_error')}  error_mul={causal.get('error_mul')}  weight_mul={causal.get('weight_mul')}",
+        ]
+        return "\n".join(head + lines)
+    return "\n".join(head)
 
 # =========================
 # 路由
@@ -211,13 +243,13 @@ def ingest(
     elif any(r["status"] == "warn" for r in results):
         overall = "warn"
 
-    # --- Step6: 可选推送 ---
+    # --- Step6: 可选推送（纯文本） ---
     notified = False
     notify_detail = ""
     if notify:
-        digest = build_digest(overall=overall, results=results, run_id=(batch.items[0].run_id if batch.items else None), dry_run=batch.dry_run)
-        ok, detail = tg_send(digest)
-        notified, notify_detail = ok, detail
+        digest = _build_digest(overall, results, (batch.items[0].run_id if batch.items else None), batch.dry_run)
+        notified = tg_send(digest)
+        notify_detail = "sent" if notified else "send_fail"
 
     return {
         "ok": True,
