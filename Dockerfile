@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir requests==2.31.0 fastapi==0.110.0 uvicorn==0.27.1
 # 复制并安装所有依赖
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt && python -m pip show requests
 
 # 复制应用代码
 COPY services/api/app.py /app/app.py
