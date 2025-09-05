@@ -4,7 +4,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # 1) 复制根目录 requirements.txt
-COPY ./requirements.txt /app/requirements.txt
+COPY requirements.txt /app/requirements.txt
 
 # 2) 安装依赖
 RUN pip install --no-cache-dir -r /app/requirements.txt
