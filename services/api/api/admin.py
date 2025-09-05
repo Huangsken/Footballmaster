@@ -231,3 +231,79 @@ def run_get(
         }
     finally:
         db.close()
+
+# ----------------------
+# Bulk Feature log（批量写入 tool_features）
+# ----------------------
+from pydantic import BaseModel, Field
+from typing import List
+import json
+from sqlalchemy import text
+
+# 复用单条的 FeatureLogInput；如你文件里未定义，可取消注释下面的定义
+# class FeatureLogInput(BaseModel):
+#     entity_type: str
+#     entity_id: str
+#     tool: str
+#     feature_key: str
+#     feature_val: dict = Field(default_factory=dict)
+#     tool_version: str
+#     source: str | None = None
+#     confidence: float | None = None
+#     computed_at: str | None = None
+
+class FeatureBulkInput(BaseModel):
+    items: List[FeatureLogInput] = Field(min_length=1, max_length=1000)
+    run_id: str | None = None      # 可选：关联一次批次，自动更新 feature_runs 计数
+    dry_run: bool = False          # 只校验不落库（用于先看一眼）
+
+@router.post("/feature-bulk-log", summary="Bulk insert tool_features (with optional run_id aggregation)")
+def feature_bulk_log(payload: FeatureBulkInput,
+                     x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
+    _auth_or_401(x_api_token)
+
+    rows = []
+    for it in payload.items:
+        rows.append({
+            "entity_type": it.entity_type,
+            "entity_id": it.entity_id,
+            "tool": it.tool,
+            "feature_key": it.feature_key,
+            "feature_val": json.dumps(it.feature_val or {}, ensure_ascii=False),
+            "tool_version": it.tool_version,
+            "source": it.source,
+            "confidence": it.confidence,
+            "computed_at": it.computed_at,
+        })
+
+    if payload.dry_run:
+        return {"ok": True, "dry_run": True, "to_insert": len(rows)}
+
+    db = SessionLocal()
+    try:
+        # 批量 INSERT
+        insert_sql = text("""
+            INSERT INTO tool_features
+                (entity_type, entity_id, tool, feature_key, feature_val,
+                 tool_version, source, confidence, computed_at)
+            VALUES
+                (:entity_type, :entity_id, :tool, :feature_key, :feature_val,
+                 :tool_version, :source, :confidence,
+                 COALESCE(CAST(:computed_at AS TIMESTAMP), CURRENT_TIMESTAMP))
+        """)
+        db.execute(insert_sql, rows)
+
+        # 可选：更新 feature_runs 统计
+        if payload.run_id:
+            agg_sql = text("""
+                UPDATE feature_runs
+                   SET total = COALESCE(total,0) + :delta,
+                       ok    = COALESCE(ok,0)    + :delta
+                 WHERE run_id = :rid
+            """)
+            db.execute(agg_sql, {"delta": len(rows), "rid": payload.run_id})
+
+        db.commit()
+        return {"ok": True, "inserted": len(rows), "run_id": payload.run_id}
+    finally:
+        db.close()
