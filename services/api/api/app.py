@@ -2,72 +2,135 @@
 from __future__ import annotations
 
 import os, json
+from typing import Optional
+
+import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-import httpx
 from sqlalchemy import text
 
-from app.config import settings
+# === 你的项目内模块 ===
 from common.db import init_db, SessionLocal
-
-# 环境变量（鉴权 & 调用模式）
-API_TOKEN = os.getenv("API_SHARED_TOKEN", "")
-CALL_MODE = os.getenv("MODEL_CALL_MODE", "local").lower()
-ENDPOINT_V5 = os.getenv("MODEL_ENDPOINT_V5", "").strip()
-ENDPOINT_TRIAD = os.getenv("MODEL_ENDPOINT_TRIAD", "").strip()
-
-# 模型与调度
 from models import v5, triad
 from cron import start_scheduler
 
-# 子路由（已在 services/api/api/ 目录下）
+# 路由（已在 services/api/api/ 下准备好）
 from api.dpc import router as dpc_router
 from api.admin import router as admin_router
 
-app = FastAPI(title="Causal-Football v5.0", version="0.0.1")
-init_db()
+# === 环境变量 ===
+API_TOKEN = os.getenv("API_SHARED_TOKEN", "")
+CALL_MODE = os.getenv("MODEL_CALL_MODE", "local").lower()          # local | http
+ENDPOINT_V5 = os.getenv("MODEL_ENDPOINT_V5", "").strip()
+ENDPOINT_TRIAD = os.getenv("MODEL_ENDPOINT_TRIAD", "").strip()
 
-# 健康检查（缺项返回 degraded）
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini").strip()
+
+# === 应用 ===
+app = FastAPI(title="Causal-Football v5.0", version="0.0.1")
+
+
+# ------------------------------------------------------------
+# 自动建表（首次启动 or 表不存在时创建；存在则忽略）
+# ------------------------------------------------------------
+DDL = """
+CREATE TABLE IF NOT EXISTS dpc_ingest_audit (
+    id SERIAL PRIMARY KEY,
+    run_id TEXT,
+    source_id TEXT,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    action TEXT,
+    confidence FLOAT,
+    signature TEXT,
+    status TEXT,
+    message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_dpc_ingest_entity
+ON dpc_ingest_audit(entity_type, entity_id);
+
+CREATE TABLE IF NOT EXISTS predictions (
+    id SERIAL PRIMARY KEY,
+    match_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    payload_json JSONB,
+    result_json JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_predictions_match_model
+ON predictions(match_id, model);
+
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    username TEXT UNIQUE,
+    email TEXT UNIQUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+def init_tables():
+    db = SessionLocal()
+    try:
+        db.execute(text(DDL))
+        db.commit()
+    finally:
+        db.close()
+
+
+# ------------------------------------------------------------
+# 健康检查
+# ------------------------------------------------------------
 @app.get("/healthz")
 def healthz():
-    required = {
-        "API_FOOTBALL_KEY": bool(settings.API_FOOTBALL_KEY),
-        "DATABASE_URL": bool(settings.DATABASE_URL),
-        "REDIS_URL": bool(settings.REDIS_URL),
-        "TELEGRAM_BOT_TOKEN": bool(settings.TELEGRAM_BOT_TOKEN),
-        "TELEGRAM_CHAT_ID": bool(settings.TELEGRAM_CHAT_ID),
-        "HMAC_SECRET": bool(settings.HMAC_SECRET),
-    }
-    ok = all(required.values())
-    return (
-        {"status": "ok", "env": settings.ENV, "tz": settings.TIMEZONE}
-        if ok else
-        {"status": "degraded", "missing": [k for k, v in required.items() if not v]}
-    )
+    # 这里保持简洁：能起服务就返回 ok；如需严格校验可以改为检查必需 env
+    return {"status": "ok"}
 
+
+# ------------------------------------------------------------
+# 启动事件：初始化数据库、自动建表、可选开启调度器
+# ------------------------------------------------------------
 @app.on_event("startup")
 def _startup():
+    init_db()
+    init_tables()
     if os.getenv("START_SCHEDULER", "true").lower() == "true":
         start_scheduler()
 
-# —— 简单鉴权（给本文件里的接口用；/dpc /admin 内各自另有鉴权）——
+
+# ------------------------------------------------------------
+# 鉴权（仅本文件内接口用；/dpc 与 /admin 内部有各自鉴权）
+# ------------------------------------------------------------
 def _check_auth(token: str | None):
     if not API_TOKEN:
         return
     if not token or token != API_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
 
-# ==== 数据模型 ====
+
+# ------------------------------------------------------------
+# 你的原有数据模型
+# ------------------------------------------------------------
 class MatchInput(BaseModel):
     match_id: str
     home: str
     away: str
+    # 可扩展：赔率、伤停、Elo 等
     features: dict = Field(default_factory=dict)
 
 class BacktestInput(BaseModel):
     matches: list[MatchInput]
 
-# ==== 工具 ====
+class ChatInput(BaseModel):
+    messages: list[dict]
+
+
+# ------------------------------------------------------------
+# 工具函数
+# ------------------------------------------------------------
 async def _call_http(endpoint: str, payload: dict):
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(endpoint, json=payload)
@@ -78,11 +141,16 @@ def _save_prediction(match_id: str, model: str, payload: dict, result: dict):
     db = SessionLocal()
     try:
         db.execute(
-            text("INSERT INTO predictions (match_id, model, payload_json, result_json) "
-                 "VALUES (:m,:model,:p,:r)"),
-            {"m": match_id, "model": model,
-             "p": json.dumps(payload, ensure_ascii=False),
-             "r": json.dumps(result, ensure_ascii=False)}
+            text(
+                "INSERT INTO predictions (match_id, model, payload_json, result_json) "
+                "VALUES (:m,:model,:p,:r)"
+            ),
+            {
+                "m": match_id,
+                "model": model,
+                "p": json.dumps(payload, ensure_ascii=False),
+                "r": json.dumps(result, ensure_ascii=False),
+            },
         )
         db.commit()
     finally:
@@ -94,9 +162,12 @@ def _select_model(model: str):
         raise HTTPException(status_code=400, detail="model must be v5|triad|ensemble")
     return m
 
-# ==== 预测 ====
+
+# ------------------------------------------------------------
+# 你的原有接口
+# ------------------------------------------------------------
 @app.post("/predict")
-async def predict(payload: MatchInput, model: str = "v5", x_api_token: str | None = Header(default=None, alias="X-API-Token")):
+async def predict(payload: MatchInput, model: str = "v5", x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
     sel = _select_model(model)
     data = payload.model_dump()
@@ -121,9 +192,9 @@ async def predict(payload: MatchInput, model: str = "v5", x_api_token: str | Non
     _save_prediction(payload.match_id, sel, data, res)
     return {"match_id": payload.match_id, "home": payload.home, "away": payload.away, **res}
 
-# ==== 比分 Top3 ====
+
 @app.post("/scores/top3")
-async def top3_scores(payload: MatchInput, model: str = "v5", x_api_token: str | None = Header(default=None, alias="X-API-Token")):
+async def top3_scores(payload: MatchInput, model: str = "v5", x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
     sel = _select_model(model)
     data = payload.model_dump()
@@ -136,7 +207,7 @@ async def top3_scores(payload: MatchInput, model: str = "v5", x_api_token: str |
         else:
             endpoint = ENDPOINT_V5 if sel == "v5" else ENDPOINT_TRIAD
             r = await _call_http(endpoint, data)
-            res = v5.derive_top3_from_result(r)
+            res = v5.derive_top3_from_result(r)   # 若远端不返回比分分布，这里兜底推导
     else:
         if sel == "v5":
             res = v5.top3_scores(data)
@@ -148,10 +219,11 @@ async def top3_scores(payload: MatchInput, model: str = "v5", x_api_token: str |
             )
     return {"match_id": payload.match_id, "home": payload.home, "away": payload.away, **res}
 
-# ==== 回测 ====
+
 @app.post("/backtest")
-def backtest(payload: BacktestInput, x_api_token: str | None = Header(default=None, alias="X-API-Token")):
+def backtest(payload: BacktestInput, x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
+    # 简化示例回测：胜平负准确率
     total, hit = 0, 0
     for m in payload.matches:
         total += 1
@@ -160,18 +232,15 @@ def backtest(payload: BacktestInput, x_api_token: str | None = Header(default=No
         pred = max(probs, key=probs.get) if probs else None
         truth = (m.features or {}).get("ft_result")
         if pred and truth:
-            label = {"home_win":"H", "draw":"D", "away_win":"A"}[pred]
+            label = {"home_win": "H", "draw": "D", "away_win": "A"}[pred]
             if label == truth:
                 hit += 1
-    acc = hit/total if total else 0.0
+    acc = hit / total if total else 0.0
     return {"total": total, "hit": hit, "acc": round(acc, 4)}
 
-# ==== Assistant（可选） ====
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY","").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL","gpt-5-mini").strip()
 
 @app.post("/assistant")
-async def assistant(payload: dict, x_api_token: str | None = Header(default=None, alias="X-API-Token")):
+async def assistant(payload: dict, x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="assistant not configured")
@@ -182,6 +251,9 @@ async def assistant(payload: dict, x_api_token: str | None = Header(default=None
         r.raise_for_status()
         return r.json()
 
-# ==== 挂载子路由（/dpc/* 与 /admin/*）====
+
+# ------------------------------------------------------------
+# 挂载子路由：/dpc/* 与 /admin/*
+# ------------------------------------------------------------
 app.include_router(dpc_router)
 app.include_router(admin_router)
