@@ -4,6 +4,7 @@ from __future__ import annotations
 from common.normalizer import normalize
 from common.factors import evaluate_factors
 from common.importance import score as importance_score
+from common.causal import causal_snapshot
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -132,12 +133,12 @@ def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=No
             )
         normalized_items.append(it)
 
-    # --- Step2: 校验 + 重要度/因子评估，收集 ---
+    # --- Step2: 校验 + 重要度/因子评估 + 因果快照 ---
     results: List[dict] = []
     to_insert: List[IngestItem] = []
 
     for it in normalized_items:
-        # 2.1 先做字段标准化（自动识别来源）
+        # 2.1 标准化 payload（自动识别来源）
         it.payload = normalize(it.payload or {})
 
         # 2.2 基础校验
@@ -149,6 +150,9 @@ def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=No
         # 2.4 赛事因子评估（吃标准化后的键）
         factors = evaluate_factors(it.payload)
 
+        # 2.5 因果快照（p0 × 乘法聚合）
+        causal = causal_snapshot(factors, it.payload, p0=0.021)
+
         results.append({
             "entity_type": it.entity_type,
             "entity_id": it.entity_id,
@@ -156,14 +160,15 @@ def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=No
             "status": res["status"],
             "message": res["message"],
             "importance": imp,     # {score, tier, priority}
-            "factors": factors     # {items:[...], aggregate:{error_mul, weight_mul}}
+            "factors": factors,    # {items:[...], aggregate:{error_mul, weight_mul}}
+            "causal": causal       # {p0, error_mul, weight_mul, adjusted_error, drivers:[...]}
         })
 
-        # 2.5 仅在 accepted 且非 dry_run 时准备入库
+        # 仅在 accepted 且非 dry_run 时准备入库
         if res["status"] == "accepted" and not batch.dry_run:
             to_insert.append(it)
 
-    # --- Step3: 批内冲突检测（基于已规范化的 items） ---
+    # --- Step3: 批内冲突检测 ---
     marks = detect_conflicts([
         {"entity_type": it.entity_type, "entity_id": it.entity_id, "payload": it.payload}
         for it in normalized_items
