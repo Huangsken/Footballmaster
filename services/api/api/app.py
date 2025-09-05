@@ -1,3 +1,4 @@
+# services/api/api/app.py
 from __future__ import annotations
 
 import os, json
@@ -5,103 +6,64 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
-from sqlalchemy import text
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
+from pydantic import BaseModel, Field
+from sqlalchemy import text
 
 from common.db import init_db, SessionLocal
-try:
-    from common.db import engine as db_engine
-except Exception:
-    from db.connection import engine as db_engine  # type: ignore
-
 from models import v5, triad
 from cron import start_scheduler
+
+# 路由
 from api.dpc import router as dpc_router
 from api.admin import router as admin_router
 
+# 统一复用 schema 的建表逻辑
+from api.schema import init_tables
+
+# === 环境变量 ===
 API_TOKEN = os.getenv("API_SHARED_TOKEN", "")
-CALL_MODE = os.getenv("MODEL_CALL_MODE", "local").lower()
+CALL_MODE = os.getenv("MODEL_CALL_MODE", "local").lower()          # local | http
 ENDPOINT_V5 = os.getenv("MODEL_ENDPOINT_V5", "").strip()
 ENDPOINT_TRIAD = os.getenv("MODEL_ENDPOINT_TRIAD", "").strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-5-mini").strip()
 
+# === FastAPI 应用 ===
 app = FastAPI(title="Causal-Football v5.0", version="0.0.1")
 
-# === CORS 允许跨域 ===
+# CORS（需要前端时再收紧域名）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # ⚠️ 可改成 ["https://your-frontend.example"]
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# === 自动建表 ===
-DDL_STATEMENTS: list[str] = [
-    """
-    CREATE TABLE IF NOT EXISTS dpc_ingest_audit (
-        id BIGSERIAL PRIMARY KEY,
-        run_id TEXT,
-        source_id TEXT,
-        entity_type TEXT NOT NULL,
-        entity_id TEXT NOT NULL,
-        action TEXT,
-        confidence DOUBLE PRECISION,
-        signature TEXT,
-        status TEXT,
-        message TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_dpc_ingest_entity ON dpc_ingest_audit(entity_type, entity_id);",
-    """
-    CREATE TABLE IF NOT EXISTS predictions (
-        id BIGSERIAL PRIMARY KEY,
-        match_id TEXT NOT NULL,
-        model TEXT NOT NULL,
-        payload_json JSONB,
-        result_json JSONB,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_predictions_match_model ON predictions(match_id, model);",
-    """
-    CREATE TABLE IF NOT EXISTS users (
-        id BIGSERIAL PRIMARY KEY,
-        username TEXT UNIQUE,
-        email TEXT UNIQUE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """
-]
-
-def init_tables() -> None:
-    with db_engine.begin() as conn:
-        for sql in DDL_STATEMENTS:
-            conn.exec_driver_sql(sql)
-
+# 健康检查
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
 
+# 启动：连接数据库、自动建表、可选调度器
 @app.on_event("startup")
 def _startup():
     init_db()
-    init_tables()
+    init_tables()  # 幂等
     if os.getenv("START_SCHEDULER", "true").lower() == "true":
         start_scheduler()
 
-# === 强制鉴权 ===
+# 简单鉴权（本文件内接口用；/dpc 与 /admin 内部自带鉴权）
 def _check_auth(token: str | None):
     if not API_TOKEN:
+        # 你希望强制要求带 token，这里没有就视为配置错误
         raise HTTPException(status_code=500, detail="server misconfigured: API_SHARED_TOKEN missing")
     if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
 
-# === 数据模型 ===
+# ==== 数据模型 ====
 class MatchInput(BaseModel):
     match_id: str
     home: str
@@ -114,7 +76,7 @@ class BacktestInput(BaseModel):
 class ChatInput(BaseModel):
     messages: list[dict]
 
-# === 工具函数 ===
+# ==== 工具 ====
 async def _call_http(endpoint: str, payload: dict):
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(endpoint, json=payload)
@@ -122,6 +84,7 @@ async def _call_http(endpoint: str, payload: dict):
         return r.json()
 
 def _save_prediction(match_id: str, model: str, payload: dict, result: dict):
+    """落库预测结果；如需完全兜底可加 try/except，但你现在已能正常入库。"""
     db = SessionLocal()
     try:
         db.execute(
@@ -146,7 +109,7 @@ def _select_model(model: str):
         raise HTTPException(status_code=400, detail="model must be v5|triad|ensemble")
     return m
 
-# === 接口 ===
+# ==== 接口 ====
 @app.post("/predict")
 async def predict(payload: MatchInput, model: str = "v5", x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
@@ -178,6 +141,7 @@ async def top3_scores(payload: MatchInput, model: str = "v5", x_api_token: str |
     _check_auth(x_api_token)
     sel  = _select_model(model)
     data = payload.model_dump()
+
     if CALL_MODE == "http":
         if sel == "ensemble":
             r1 = await _call_http(ENDPOINT_V5, data)
@@ -227,11 +191,11 @@ async def assistant(payload: dict, x_api_token: str | None = Header(default=None
         r.raise_for_status()
         return r.json()
 
-# === 挂载子路由 ===
+# 挂载子路由
 app.include_router(dpc_router)
 app.include_router(admin_router)
 
-# === 自定义 Swagger：加全局 X-API-Token Header ===
+# 自定义 Swagger：要求全局 X-API-Token
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
