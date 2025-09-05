@@ -192,3 +192,76 @@ def feature_log(payload: FeatureLogInput,
         return {"ok": True, "id": new_id}
     finally:
         db.close()
+
+# ----------------------
+# Get features（按实体/工具查询 tool_features）
+# ----------------------
+@router.get("/feature-get", summary="Query tool_features by entity/tool")
+def feature_get(
+    entity_type: str,
+    entity_id: str,
+    tool: Optional[str] = None,
+    feature_key: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
+):
+    """
+    查询已写入的工具特征。
+    - 必填：entity_type, entity_id
+    - 可选过滤：tool, feature_key
+    - 支持分页：limit, offset
+    """
+    _auth_or_401(x_api_token)
+
+    where = ["entity_type = :entity_type", "entity_id = :entity_id"]
+    params = {"entity_type": entity_type, "entity_id": entity_id, "limit": limit, "offset": offset}
+
+    if tool:
+        where.append("tool = :tool")
+        params["tool"] = tool
+    if feature_key:
+        where.append("feature_key = :feature_key")
+        params["feature_key"] = feature_key
+
+    sql = text(f"""
+        SELECT
+            id,
+            entity_type,
+            entity_id,
+            tool,
+            feature_key,
+            feature_val::text AS feature_val_text,
+            tool_version,
+            source,
+            confidence,
+            computed_at
+        FROM tool_features
+        WHERE {" AND ".join(where)}
+        ORDER BY id DESC
+        LIMIT :limit OFFSET :offset
+    """)
+
+    db = SessionLocal()
+    try:
+        rows = db.execute(sql, params).mappings().all()
+        items = []
+        for r in rows:
+            # feature_val_text 是 json 字符串，转回 dict
+            fv = json.loads(r["feature_val_text"]) if r["feature_val_text"] else None
+            items.append({
+                "id": r["id"],
+                "entity_type": r["entity_type"],
+                "entity_id": r["entity_id"],
+                "tool": r["tool"],
+                "feature_key": r["feature_key"],
+                "feature_val": fv,
+                "tool_version": r["tool_version"],
+                "source": r["source"],
+                "confidence": r["confidence"],
+                "computed_at": r["computed_at"],
+            })
+        return {"ok": True, "count": len(items), "items": items}
+    finally:
+        db.close()
+
