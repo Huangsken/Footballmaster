@@ -15,9 +15,13 @@ class IngestItem(BaseModel):
     schema_name: str = Field(..., description="逻辑表/事件名，如 player, match, referee, ingest_raw 等")
     schema_version: str = Field(..., description="schema 版本号，如 1.0.0")
     entity_type: str = Field(..., description="player/team/match/referee/news 等")
-    entity_id: str = Field(..., description="实体主键或来源方主键")
+
+    # 允许为空；后续会自动补 UID（不要在校验器里校验 entity_id 非空）
+    entity_id: str | None = Field(default="", description="实体主键或来源方主键；可留空，后续自动生成")
+
     # 数据体
     payload: dict[str, Any] = Field(..., description="具体数据内容（已做标准化或原始数据）")
+
     # 审计信息（可选）
     run_id: Optional[str] = Field(default=None, description="本次任务/抓取批次 ID")
     source_id: Optional[str] = Field(default=None, description="来源标识（供应商/URL/爬虫名）")
@@ -34,14 +38,15 @@ class IngestItem(BaseModel):
             raise ValueError("confidence must be in [0,1]")
         return v
 
+    # 注意：不再包含 entity_id
     @field_validator("schema_name", "schema_version", "entity_type")
-@classmethod
-def _no_blank(cls, v: str) -> str:
-    if not v or not v.strip():
-        raise ValueError("must not be empty")
-    return v.strip()
+    @classmethod
+    def _no_blank(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("must not be empty")
+        return v.strip()
 
-class IngestBatch(BaseModel):
+bclass IngestBatch(BaseModel):
     items: List[IngestItem] = Field(..., description="批量项目，最多 500 条")
     dry_run: bool = Field(True, description="仅校验不落库（默认 True）")
 
