@@ -3,19 +3,21 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# 1) 先复制 requirements.txt 并安装
+# 1) 复制根目录 requirements.txt
 COPY ./requirements.txt /app/requirements.txt
+
+# 2) 安装依赖
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# 2) 再复制代码
+# 3) 复制代码
 COPY services/api/app.py   /app/app.py
 COPY services/api/cron.py  /app/cron.py
 COPY services/api/models   /app/models
 COPY common                /app/common
 
-# 3) 环境
+# 4) 环境变量
 ENV PORT=8080
 EXPOSE 8080
 
-# 4) 启动 API
+# 5) 启动 API
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
