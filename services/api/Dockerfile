@@ -3,18 +3,18 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# 先装一部分基础依赖（可选，但能更清晰看到失败点）
+# 先安装三大核心依赖，能更好命中缓存
 RUN pip install --no-cache-dir requests==2.31.0 fastapi==0.110.0 uvicorn==0.27.1
 
-# 复制并安装项目依赖（注意：这里的 requirements.txt 在 services/api/ 目录里）
+# 安装其余依赖
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt && python -m pip show requests
 
-# 复制应用代码（相对路径都是相对 services/api/）
-COPY app.py /app/app.py
-COPY cron.py /app/cron.py
-COPY models /app/models
-COPY common /app/common
+# 复制应用代码
+COPY services/api/app.py /app/app.py
+COPY services/api/cron.py /app/cron.py
+COPY services/api/models /app/models
+COPY services/api/common /app/common
 
 # 环境
 ENV PORT=8080
