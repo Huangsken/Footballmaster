@@ -1,3 +1,4 @@
+from common.importance import score as importance_score
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from typing import Any, List, Optional
@@ -118,17 +119,24 @@ def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=No
         normalized_items.append(it)
 
     # === Step2: 校验 + 收集 ===
-    results = []
+        results = []
     to_insert = []
     for it in normalized_items:
         res = _validate_item(it)
+
+        # 重要度评分（不依赖数据库）
+        imp = importance_score(it.entity_type, it.payload)
+
         results.append({
             "entity_type": it.entity_type,
             "entity_id": it.entity_id,
             "schema": f"{it.schema_name}@{it.schema_version}",
             "status": res["status"],
             "message": res["message"],
+            "importance": imp  # {score, tier, priority}
         })
+
+        # 只有通过、且非 dry-run 的才考虑入库
         if res["status"] == "accepted" and not batch.dry_run:
             to_insert.append(it)
 
