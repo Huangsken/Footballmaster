@@ -213,9 +213,11 @@ def ingest(
 
     # --- Step6: 可选推送 ---
     notified = False
+    notify_detail = ""
     if notify:
         digest = build_digest(overall=overall, results=results, run_id=(batch.items[0].run_id if batch.items else None), dry_run=batch.dry_run)
-        notified = tg_send(digest)
+        ok, detail = tg_send(digest)
+        notified, notify_detail = ok, detail
 
     return {
         "ok": True,
@@ -224,5 +226,6 @@ def ingest(
         "results": results,
         "dry_run": batch.dry_run,
         "inserted": inserted,
-        "notified": notified
+        "notified": notified,
+        "notify_detail": notify_detail
     }
