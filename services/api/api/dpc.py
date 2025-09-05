@@ -5,8 +5,9 @@ from common.normalizer import normalize
 from common.factors import evaluate_factors
 from common.importance import score as importance_score
 from common.causal import causal_snapshot
+from common.notify import tg_send, build_digest
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from typing import Any, List, Optional
 from app.config import settings
@@ -26,11 +27,7 @@ class IngestItem(BaseModel):
     schema_name: str = Field(..., description="逻辑表/事件名，如 player, match, referee, ingest_raw 等")
     schema_version: str = Field(..., description="schema 版本号，如 1.0.0")
     entity_type: str = Field(..., description="player/team/match/referee/news 等")
-
-    # 允许为空；后续会自动补 UID
     entity_id: str | None = Field(default="", description="实体主键或来源方主键；可留空，后续自动生成")
-
-    # 数据体
     payload: dict[str, Any] = Field(..., description="具体数据内容（已做标准化或原始数据）")
 
     # 审计信息（可选）
@@ -49,7 +46,6 @@ class IngestItem(BaseModel):
             raise ValueError("confidence must be in [0,1]")
         return v
 
-    # 注意：entity_id 不再强制非空
     @field_validator("schema_name", "schema_version", "entity_type")
     @classmethod
     def _no_blank(cls, v: str) -> str:
@@ -99,7 +95,11 @@ def _auth_or_403(token: Optional[str]):
 # =========================
 
 @router.post("/ingest")
-def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=None, alias="X-Ingest-Token")):
+def ingest(
+    batch: IngestBatch,
+    x_ingest_token: Optional[str] = Header(default=None, alias="X-Ingest-Token"),
+    notify: bool = Query(default=False, description="是否推送 Telegram 摘要")
+):
     _auth_or_403(x_ingest_token)
     now = time.time()
 
@@ -159,12 +159,11 @@ def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=No
             "schema": f"{it.schema_name}@{it.schema_version}",
             "status": res["status"],
             "message": res["message"],
-            "importance": imp,     # {score, tier, priority}
-            "factors": factors,    # {items:[...], aggregate:{error_mul, weight_mul}}
-            "causal": causal       # {p0, error_mul, weight_mul, adjusted_error, drivers:[...]}
+            "importance": imp,
+            "factors": factors,
+            "causal": causal
         })
 
-        # 仅在 accepted 且非 dry_run 时准备入库
         if res["status"] == "accepted" and not batch.dry_run:
             to_insert.append(it)
 
@@ -212,6 +211,12 @@ def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=No
     elif any(r["status"] == "warn" for r in results):
         overall = "warn"
 
+    # --- Step6: 可选推送 ---
+    notified = False
+    if notify:
+        digest = build_digest(overall=overall, results=results, run_id=(batch.items[0].run_id if batch.items else None), dry_run=batch.dry_run)
+        notified = tg_send(digest)
+
     return {
         "ok": True,
         "overall": overall,
@@ -219,4 +224,5 @@ def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=No
         "results": results,
         "dry_run": batch.dry_run,
         "inserted": inserted,
+        "notified": notified
     }
