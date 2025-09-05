@@ -125,8 +125,10 @@ def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=No
     for it in normalized_items:
         res = _validate_item(it)
 
-        # 重要度评分（不依赖数据库）
+        # 重要度评分
         imp = importance_score(it.entity_type, it.payload)
+        # 赛事因子评估（可选上下文：此处用 item 的 payload 作为最小上下文）
+        factors = evaluate_factors(it.payload)
 
         results.append({
             "entity_type": it.entity_type,
@@ -134,7 +136,8 @@ def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=No
             "schema": f"{it.schema_name}@{it.schema_version}",
             "status": res["status"],
             "message": res["message"],
-            "importance": imp  # {score, tier, priority}
+            "importance": imp,           # {score, tier, priority}
+            "factors": factors           # {items:[...], aggregate:{error_mul, weight_mul}}
         })
 
         # 只有通过、且非 dry-run 的才考虑入库
