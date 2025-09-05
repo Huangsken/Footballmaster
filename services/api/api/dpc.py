@@ -1,6 +1,10 @@
+from __future__ import annotations
+
+# --- imports ---
 from common.normalizer import normalize
 from common.factors import evaluate_factors
 from common.importance import score as importance_score
+
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from typing import Any, List, Optional
@@ -12,7 +16,9 @@ from common.uid import make_player_uid, make_coach_uid, make_ref_uid, detect_con
 
 router = APIRouter(prefix="/dpc", tags=["dpc"])
 
-# ==== 入库数据契约（最小集） ====
+# =========================
+# 入库数据契约（最小集）
+# =========================
 
 class IngestItem(BaseModel):
     # 元信息
@@ -63,7 +69,10 @@ class IngestBatch(BaseModel):
             raise ValueError("items too many (<=500)")
         return v
 
-# ==== 简易规则检查 ====
+# =========================
+# 基础校验 & 鉴权
+# =========================
+
 def _validate_item(it: IngestItem) -> dict:
     if not it.payload:
         return {"status": "block", "message": "payload empty"}
@@ -84,13 +93,16 @@ def _auth_or_403(token: Optional[str]):
     if (token or "").strip() != secret:
         raise HTTPException(status_code=403, detail="forbidden")
 
-# ==== 路由 ====
+# =========================
+# 路由
+# =========================
+
 @router.post("/ingest")
 def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=None, alias="X-Ingest-Token")):
     _auth_or_403(x_ingest_token)
     now = time.time()
 
-    # === Step1: 补全/标准化 entity_id ===
+    # --- Step1: 补全/标准化 entity_id ---
     normalized_items: List[IngestItem] = []
     for it in batch.items:
         if it.snapshot_ts is None:
@@ -120,52 +132,53 @@ def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=No
             )
         normalized_items.append(it)
 
-# === Step2: 校验 + 收集 ===
-results = []
-to_insert = []
+    # --- Step2: 校验 + 重要度/因子评估，收集 ---
+    results: List[dict] = []
+    to_insert: List[IngestItem] = []
 
-for it in normalized_items:
-    # 标准化 payload（自动识别来源）
-    it.payload = normalize(it.payload or {})
+    for it in normalized_items:
+        # 2.1 先做字段标准化（自动识别来源）
+        it.payload = normalize(it.payload or {})
 
-    # 基础校验
-    res = _validate_item(it)
+        # 2.2 基础校验
+        res = _validate_item(it)
 
-    # 重要度评分（基于标准化后的 payload）
-    imp = importance_score(it.entity_type, it.payload)
+        # 2.3 重要度评分（基于标准化后的 payload）
+        imp = importance_score(it.entity_type, it.payload)
 
-    # 赛事因子评估（吃标准化后的键）
-    factors = evaluate_factors(it.payload)
+        # 2.4 赛事因子评估（吃标准化后的键）
+        factors = evaluate_factors(it.payload)
 
-    results.append({
-        "entity_type": it.entity_type,
-        "entity_id": it.entity_id,
-        "schema": f"{it.schema_name}@{it.schema_version}",
-        "status": res["status"],
-        "message": res["message"],
-        "importance": imp,     # {score, tier, priority}
-        "factors": factors     # {items:[...], aggregate:{error_mul, weight_mul}}
-    })
+        results.append({
+            "entity_type": it.entity_type,
+            "entity_id": it.entity_id,
+            "schema": f"{it.schema_name}@{it.schema_version}",
+            "status": res["status"],
+            "message": res["message"],
+            "importance": imp,     # {score, tier, priority}
+            "factors": factors     # {items:[...], aggregate:{error_mul, weight_mul}}
+        })
 
-    # 只有通过、且非 dry_run 的才考虑入库
-    if res["status"] == "accepted" and not batch.dry_run:
-        to_insert.append(it)
+        # 2.5 仅在 accepted 且非 dry_run 时准备入库
+        if res["status"] == "accepted" and not batch.dry_run:
+            to_insert.append(it)
 
-    # === Step3: 批内冲突检测 ===
+    # --- Step3: 批内冲突检测（基于已规范化的 items） ---
     marks = detect_conflicts([
         {"entity_type": it.entity_type, "entity_id": it.entity_id, "payload": it.payload}
         for it in normalized_items
     ])
     for r in results:
-        if r["entity_id"] in marks:
-            tag = marks[r["entity_id"]]
-            if tag.startswith("block"):
-                r["status"] = "block"
-            elif tag.startswith("warn") and r["status"] == "accepted":
-                r["status"] = "warn"
-            r["message"] = (r["message"] + f" | {tag}") if r["message"] else tag
+        tag = marks.get(r["entity_id"])
+        if not tag:
+            continue
+        if tag.startswith("block"):
+            r["status"] = "block"
+        elif tag.startswith("warn") and r["status"] == "accepted":
+            r["status"] = "warn"
+        r["message"] = (r["message"] + f" | {tag}") if r["message"] else tag
 
-    # === Step4: 真写库（仅 accepted & 非 dry_run） ===
+    # --- Step4: 真写库（仅 accepted & 非 dry_run） ---
     inserted = 0
     if to_insert:
         sql = """
@@ -187,7 +200,7 @@ for it in normalized_items:
             exec_sql(sql, **params)
             inserted += 1
 
-    # === Step5: overall 状态汇总 ===
+    # --- Step5: overall 状态汇总 ---
     overall = "accepted"
     if any(r["status"] == "block" for r in results):
         overall = "block"
