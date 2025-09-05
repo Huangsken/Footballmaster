@@ -157,8 +157,8 @@ def _save_prediction(match_id: str, model: str, payload: dict, result: dict):
             {
                 "m": match_id,
                 "model": model,
-                "p": json.dumps(payload, ensure_ascii=False),
-                "r": json.dumps(result, ensure_ascii=False),
+                "p": PgJson(payload),  # ✅ 关键：让驱动按 JSON 传递
+                "r": PgJson(result),   # ✅
             },
         )
         db.commit()
