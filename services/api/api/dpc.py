@@ -1,3 +1,4 @@
+from db.connection import exec_sql
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from typing import Any, List, Optional
@@ -83,26 +84,50 @@ def _auth_or_403(token: Optional[str]):
 
 @router.post("/ingest")
 def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=None, alias="X-Ingest-Token")):
-    """
-    DPC 入库最小契约：仅做字段校验 + 规则判断，返回逐条状态，不落库。
-    生产使用时，可在 status=accepted 的条目上对接真正的入库逻辑。
-    """
     _auth_or_403(x_ingest_token)
     now = time.time()
 
     results = []
+    to_insert = []
+
     for it in batch.items:
-        # 默认时间戳补齐（客户端可不传）
         if it.snapshot_ts is None:
             it.snapshot_ts = now
         res = _validate_item(it)
-        results.append({
+        result_row = {
             "entity_type": it.entity_type,
             "entity_id": it.entity_id,
             "schema": f"{it.schema_name}@{it.schema_version}",
             "status": res["status"],
             "message": res["message"],
-        })
+        }
+        results.append(result_row)
+
+        # 如果状态是 accepted 并且不是 dry_run，则准备入库
+        if res["status"] == "accepted" and not batch.dry_run:
+            to_insert.append(it)
+
+    # === 执行入库 ===
+    inserted = 0
+    if to_insert:
+        sql = """
+        INSERT INTO dpc_ingest_audit
+        (run_id, source_id, entity_type, entity_id, action, confidence, signature, status, message)
+        VALUES (:run_id, :source_id, :entity_type, :entity_id, 'ingest', :confidence, :signature, :status, :message)
+        """
+        for it in to_insert:
+            params = {
+                "run_id": it.run_id or "manual",
+                "source_id": it.source_id or "unknown",
+                "entity_type": it.entity_type,
+                "entity_id": it.entity_id,
+                "confidence": it.confidence or 1.0,
+                "signature": it.signature or None,
+                "status": "accepted",
+                "message": "ok",
+            }
+            exec_sql(sql, **params)
+            inserted += 1
 
     overall = "accepted"
     if any(r["status"] == "block" for r in results):
@@ -116,4 +141,5 @@ def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=No
         "count": len(results),
         "results": results,
         "dry_run": batch.dry_run,
+        "inserted": inserted,
     }
