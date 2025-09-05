@@ -120,13 +120,15 @@ def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=No
             )
         normalized_items.append(it)
 
-    # === Step2: 校验 + 收集 ===
-        results = []
-    to_insert = []
-    for it in normalized_items:
-    # 先做字段标准化（自动识别来源）
+# === Step2: 校验 + 收集 ===
+results = []
+to_insert = []
+
+for it in normalized_items:
+    # 标准化 payload（自动识别来源）
     it.payload = normalize(it.payload or {})
 
+    # 基础校验
     res = _validate_item(it)
 
     # 重要度评分（基于标准化后的 payload）
@@ -141,13 +143,13 @@ def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=No
         "schema": f"{it.schema_name}@{it.schema_version}",
         "status": res["status"],
         "message": res["message"],
-        "importance": imp,
-        "factors": factors
+        "importance": imp,     # {score, tier, priority}
+        "factors": factors     # {items:[...], aggregate:{error_mul, weight_mul}}
     })
 
-        # 只有通过、且非 dry-run 的才考虑入库
-        if res["status"] == "accepted" and not batch.dry_run:
-            to_insert.append(it)
+    # 只有通过、且非 dry_run 的才考虑入库
+    if res["status"] == "accepted" and not batch.dry_run:
+        to_insert.append(it)
 
     # === Step3: 批内冲突检测 ===
     marks = detect_conflicts([
