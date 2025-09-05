@@ -1,3 +1,4 @@
+from common.normalizer import normalize
 from common.factors import evaluate_factors
 from common.importance import score as importance_score
 from fastapi import APIRouter, Header, HTTPException
