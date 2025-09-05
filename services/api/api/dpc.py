@@ -124,22 +124,26 @@ def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=No
         results = []
     to_insert = []
     for it in normalized_items:
-        res = _validate_item(it)
+    # 先做字段标准化（自动识别来源）
+    it.payload = normalize(it.payload or {})
 
-        # 重要度评分
-        imp = importance_score(it.entity_type, it.payload)
-        # 赛事因子评估（可选上下文：此处用 item 的 payload 作为最小上下文）
-        factors = evaluate_factors(it.payload)
+    res = _validate_item(it)
 
-        results.append({
-            "entity_type": it.entity_type,
-            "entity_id": it.entity_id,
-            "schema": f"{it.schema_name}@{it.schema_version}",
-            "status": res["status"],
-            "message": res["message"],
-            "importance": imp,           # {score, tier, priority}
-            "factors": factors           # {items:[...], aggregate:{error_mul, weight_mul}}
-        })
+    # 重要度评分（基于标准化后的 payload）
+    imp = importance_score(it.entity_type, it.payload)
+
+    # 赛事因子评估（吃标准化后的键）
+    factors = evaluate_factors(it.payload)
+
+    results.append({
+        "entity_type": it.entity_type,
+        "entity_id": it.entity_id,
+        "schema": f"{it.schema_name}@{it.schema_version}",
+        "status": res["status"],
+        "message": res["message"],
+        "importance": imp,
+        "factors": factors
+    })
 
         # 只有通过、且非 dry-run 的才考虑入库
         if res["status"] == "accepted" and not batch.dry_run:
