@@ -1,31 +1,25 @@
+import os
 import requests
-from app.config import settings
-from typing import Tuple
 
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-def tg_send(text: str) -> Tuple[bool, str]:
+def tg_send(text: str) -> bool:
     """
-    发送 Telegram 消息（纯文本，不使用 parse_mode）
+    简单封装的 Telegram 发送函数
     """
-    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": settings.TELEGRAM_CHAT_ID,
-        "text": text,
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        data = r.json()
-        if data.get("ok"):
-            return True, "sent"
-        else:
-            return False, str(data)
-    except Exception as e:
-        return False, str(e)
+    if not BOT_TOKEN or not CHAT_ID:
+        return False
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    resp = requests.post(url, json={
+        "chat_id": CHAT_ID,
+        "text": text
+    })
+    return resp.ok
 
-
-def notify_summary(title: str, body: str) -> Tuple[bool, str]:
+def notify_summary(title: str, body: str) -> bool:
     """
-    封装的通知入口
+    对外统一入口
     """
     text = f"📢 {title}\n\n{body}"
     return tg_send(text)
