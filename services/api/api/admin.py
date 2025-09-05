@@ -1,11 +1,10 @@
 # services/api/api/admin.py
 from __future__ import annotations
 
-import os, json
+import os
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from common.notify import tg_send
@@ -137,6 +136,7 @@ DDL_STATEMENTS: list[str] = [
     """
 ]
 
+
 @router.post("/init-db", summary="Init DB schema")
 def init_db_stub(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
     _auth_or_401(x_api_token)
@@ -147,231 +147,41 @@ def init_db_stub(x_api_token: Optional[str] = Header(default=None, alias="X-API-
 
 
 # ----------------------
-# Feature log（写入 tool_features）
+# Run Finish 更新
 # ----------------------
-class FeatureLogInput(BaseModel):
-    entity_type: str
-    entity_id: str
-    tool: str
-    feature_key: str
-    feature_val: dict = Field(default_factory=dict)
-    tool_version: str
-    source: str | None = None
-    confidence: float | None = None
-    computed_at: str | None = None  # ISO 字符串，可空
-
-@router.post("/feature-log", summary="Write tool feature into tool_features")
-def feature_log(payload: FeatureLogInput,
-                x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
-    _auth_or_401(x_api_token)
-    db = SessionLocal()
-    try:
-        sql = text("""
-            INSERT INTO tool_features
-                (entity_type, entity_id, tool, feature_key, feature_val,
-                 tool_version, source, confidence, computed_at)
-            VALUES
-                (:entity_type, :entity_id, :tool, :feature_key, :feature_val,
-                 :tool_version, :source, :confidence,
-                 COALESCE(CAST(:computed_at AS TIMESTAMP), CURRENT_TIMESTAMP))
-            RETURNING id
-        """)
-        params = {
-            "entity_type": payload.entity_type,
-            "entity_id":   payload.entity_id,
-            "tool":        payload.tool,
-            "feature_key": payload.feature_key,
-            "feature_val": json.dumps(payload.feature_val, ensure_ascii=False),
-            "tool_version": payload.tool_version,
-            "source":       payload.source,
-            "confidence":   payload.confidence,
-            "computed_at":  payload.computed_at,
-        }
-        new_id = db.execute(sql, params).scalar()
-        db.commit()
-        return {"ok": True, "id": new_id}
-    finally:
-        db.close()
-
-# ----------------------
-# Get features（按实体/工具查询 tool_features）
-# ----------------------
-@router.get("/feature-get", summary="Query tool_features by entity/tool")
-def feature_get(
-    entity_type: str,
-    entity_id: str,
-    tool: Optional[str] = None,
-    feature_key: Optional[str] = None,
-    limit: int = 100,
-    offset: int = 0,
-    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
-):
+@router.post("/run-finish", summary="Finish a feature run")
+def run_finish(body: dict, x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
     """
-    查询已写入的工具特征。
-    - 必填：entity_type, entity_id
-    - 可选过滤：tool, feature_key
-    - 支持分页：limit, offset
+    更新 feature_runs 的执行结果。
+    body 示例:
+    {
+        "run_id": "run-20250906-001",
+        "total": 39,
+        "ok": 37,
+        "fail": 2,
+        "status": "finished",
+        "note": "zodiac degrees computed for EPL-2025-01"
+    }
     """
     _auth_or_401(x_api_token)
-
-    where = ["entity_type = :entity_type", "entity_id = :entity_id"]
-    params = {"entity_type": entity_type, "entity_id": entity_id, "limit": limit, "offset": offset}
-
-    if tool:
-        where.append("tool = :tool")
-        params["tool"] = tool
-    if feature_key:
-        where.append("feature_key = :feature_key")
-        params["feature_key"] = feature_key
-
-    sql = text(f"""
-        SELECT
-            id,
-            entity_type,
-            entity_id,
-            tool,
-            feature_key,
-            feature_val::text AS feature_val_text,
-            tool_version,
-            source,
-            confidence,
-            computed_at
-        FROM tool_features
-        WHERE {" AND ".join(where)}
-        ORDER BY id DESC
-        LIMIT :limit OFFSET :offset
-    """)
-
     db = SessionLocal()
     try:
-        rows = db.execute(sql, params).mappings().all()
-        items = []
-        for r in rows:
-            # feature_val_text 是 json 字符串，转回 dict
-            fv = json.loads(r["feature_val_text"]) if r["feature_val_text"] else None
-            items.append({
-                "id": r["id"],
-                "entity_type": r["entity_type"],
-                "entity_id": r["entity_id"],
-                "tool": r["tool"],
-                "feature_key": r["feature_key"],
-                "feature_val": fv,
-                "tool_version": r["tool_version"],
-                "source": r["source"],
-                "confidence": r["confidence"],
-                "computed_at": r["computed_at"],
-            })
-        return {"ok": True, "count": len(items), "items": items}
-    finally:
-        db.close()
-
-# --- add below in services/api/api/admin.py ---
-
-from pydantic import BaseModel
-from datetime import datetime
-from sqlalchemy import text
-
-# ===============================
-# feature_runs 批次运行管理接口
-# ===============================
-
-class RunStart(BaseModel):
-    run_id: str
-    tool: str
-    note: str | None = None
-
-@router.post("/run-start", summary="Start a feature run (create or reset)")
-def run_start(payload: RunStart, x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
-    _auth_or_401(x_api_token)
-    db = SessionLocal()
-    try:
-        # 是否已存在
-        row = db.execute(text("SELECT id FROM feature_runs WHERE run_id = :rid LIMIT 1"), {"rid": payload.run_id}).first()
-        if row:
-            db.execute(
-                text("""
-                    UPDATE feature_runs
-                    SET tool=:tool, total=0, ok=0, fail=0, status='running',
-                        note=:note, started_at=NOW(), finished_at=NULL
-                    WHERE run_id=:rid
-                """),
-                {"tool": payload.tool, "note": payload.note, "rid": payload.run_id},
-            )
-            db.commit()
-            return {"ok": True, "id": row[0], "reset": True}
-        else:
-            res = db.execute(
-                text("""
-                    INSERT INTO feature_runs (run_id, tool, total, ok, fail, status, note, started_at)
-                    VALUES (:rid, :tool, 0, 0, 0, 'running', :note, NOW())
-                    RETURNING id
-                """),
-                {"rid": payload.run_id, "tool": payload.tool, "note": payload.note},
-            )
-            new_id = res.scalar()
-            db.commit()
-            return {"ok": True, "id": int(new_id), "reset": False}
-    finally:
-        db.close()
-
-
-class RunFinish(BaseModel):
-    run_id: str
-    ok: int = 0
-    fail: int = 0
-    status: str = "finished"   # 'finished' / 'failed' / 'partial' 等
-    note: str | None = None
-
-@router.post("/run-finish", summary="Finish a feature run (update stats)")
-def run_finish(payload: RunFinish, x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
-    _auth_or_401(x_api_token)
-    db = SessionLocal()
-    try:
-        result = db.execute(
+        db.execute(
             text("""
                 UPDATE feature_runs
-                   SET ok=:ok, fail=:fail, status=:status,
-                       note=COALESCE(:note, note), finished_at=NOW()
-                 WHERE run_id=:rid
+                SET total=:total, ok=:ok, fail=:fail, status=:status, note=:note, finished_at=NOW()
+                WHERE run_id=:run_id
             """),
-            {"ok": payload.ok, "fail": payload.fail, "status": payload.status, "note": payload.note, "rid": payload.run_id},
+            {
+                "run_id": body.get("run_id"),
+                "total": body.get("total", 0),
+                "ok": body.get("ok", 0),
+                "fail": body.get("fail", 0),
+                "status": body.get("status", "finished"),
+                "note": body.get("note", ""),
+            },
         )
         db.commit()
-        return {"ok": True, "updated": result.rowcount}
-    finally:
-        db.close()
-
-
-@router.get("/run-get", summary="Get feature run records")
-def run_get(
-    run_id: Optional[str] = None,
-    tool: Optional[str] = None,
-    limit: int = 100,
-    offset: int = 0,
-    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
-):
-    _auth_or_401(x_api_token)
-    db = SessionLocal()
-    try:
-        conds = []
-        params = {"limit": limit, "offset": offset}
-        if run_id:
-            conds.append("run_id = :rid")
-            params["rid"] = run_id
-        if tool:
-            conds.append("tool = :tool")
-            params["tool"] = tool
-        where_sql = ("WHERE " + " AND ".join(conds)) if conds else ""
-        rows = db.execute(
-            text(f"""
-                SELECT id, run_id, tool, total, ok, fail, status, note, started_at, finished_at
-                  FROM feature_runs
-                {where_sql}
-                ORDER BY id DESC
-                LIMIT :limit OFFSET :offset
-            """),
-            params,
-        ).mappings().all()
-        return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
+        return {"ok": True, "updated": 1}
     finally:
         db.close()
