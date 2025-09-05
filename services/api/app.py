@@ -11,7 +11,7 @@ ENDPOINT_V5 = os.getenv("MODEL_ENDPOINT_V5", "").strip()
 ENDPOINT_TRIAD = os.getenv("MODEL_ENDPOINT_TRIAD", "").strip()
 
 from models import v5, triad
-from .cron import start_scheduler
+from cron import start_scheduler
 
 app = FastAPI()
 init_db()
