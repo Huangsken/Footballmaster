@@ -415,3 +415,176 @@ def run_get(
         return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
     finally:
         db.close()
+
+# =========================
+# Feature logging endpoints
+# =========================
+from sqlalchemy import text
+import json
+
+@router.post("/feature-log", summary="Log one feature row")
+def feature_log(
+    item: FeatureLogInput,
+    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
+):
+    _auth_or_401(x_api_token)
+    db = SessionLocal()
+    try:
+        r = db.execute(
+            text(
+                """
+                INSERT INTO tool_features
+                (entity_type, entity_id, tool, feature_key, feature_val, tool_version, source, confidence, computed_at)
+                VALUES
+                (:entity_type, :entity_id, :tool, :feature_key, CAST(:feature_val AS JSONB),
+                 :tool_version, :source, :confidence, COALESCE(:computed_at, CURRENT_TIMESTAMP))
+                RETURNING id
+                """
+            ),
+            {
+                "entity_type": item.entity_type,
+                "entity_id": item.entity_id,
+                "tool": item.tool,
+                "feature_key": item.feature_key,
+                "feature_val": json.dumps(item.feature_val, ensure_ascii=False),
+                "tool_version": item.tool_version,
+                "source": item.source or "manual",
+                "confidence": float(item.confidence or 1.0),
+                "computed_at": item.computed_at,
+            },
+        )
+        new_id = r.scalar()
+        db.commit()
+        return {"ok": True, "id": new_id}
+    finally:
+        db.close()
+
+
+@router.post("/feature-bulk-log", summary="Bulk log feature rows")
+def feature_bulk_log(
+    payload: FeatureBulkInput,
+    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
+):
+    """
+    批量写入特征；若 dry_run=True 则只做校验不写库。
+    run_id 字段仅作为回显，不在此处自动写 feature_runs（你已单独有 run-start/run-finish）。
+    """
+    _auth_or_401(x_api_token)
+
+    total = len(payload.items or [])
+    ok, fail = 0, 0
+    inserted_ids: list[int] = []
+
+    if payload.dry_run:
+        # 仅校验 schema，不落库
+        return {"ok": True, "dry_run": True, "total": total, "ok": total, "fail": 0, "ids": []}
+
+    db = SessionLocal()
+    try:
+        for it in payload.items:
+            try:
+                r = db.execute(
+                    text(
+                        """
+                        INSERT INTO tool_features
+                        (entity_type, entity_id, tool, feature_key, feature_val, tool_version, source, confidence, computed_at)
+                        VALUES
+                        (:entity_type, :entity_id, :tool, :feature_key, CAST(:feature_val AS JSONB),
+                         :tool_version, :source, :confidence, COALESCE(:computed_at, CURRENT_TIMESTAMP))
+                        RETURNING id
+                        """
+                    ),
+                    {
+                        "entity_type": it.entity_type,
+                        "entity_id": it.entity_id,
+                        "tool": it.tool,
+                        "feature_key": it.feature_key,
+                        "feature_val": json.dumps(it.feature_val, ensure_ascii=False),
+                        "tool_version": it.tool_version,
+                        "source": it.source or "manual",
+                        "confidence": float(it.confidence or 1.0),
+                        "computed_at": it.computed_at,
+                    },
+                )
+                inserted_ids.append(r.scalar())
+                ok += 1
+            except Exception:
+                db.rollback()
+                fail += 1
+            else:
+                # 为减少事务开销，按批次统一提交；也可这里小步提交
+                pass
+
+        db.commit()
+        return {
+            "ok": True,
+            "run_id": payload.run_id,
+            "total": total,
+            "inserted": ok,
+            "failed": fail,
+            "ids": inserted_ids,
+        }
+    finally:
+        db.close()
+
+
+@router.get("/feature-get", summary="Query feature rows")
+def feature_get(
+    entity_type: str,
+    entity_id: str,
+    tool: Optional[str] = None,
+    feature_key: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
+):
+    _auth_or_401(x_api_token)
+
+    where = ["entity_type = :entity_type", "entity_id = :entity_id"]
+    params = {"entity_type": entity_type, "entity_id": entity_id, "limit": limit, "offset": offset}
+
+    if tool:
+        where.append("tool = :tool")
+        params["tool"] = tool
+    if feature_key:
+        where.append("feature_key = :feature_key")
+        params["feature_key"] = feature_key
+
+    sql = f"""
+        SELECT id, entity_type, entity_id, tool, feature_key, feature_val, tool_version,
+               source, confidence, computed_at
+        FROM tool_features
+        WHERE {" AND ".join(where)}
+        ORDER BY id DESC
+        LIMIT :limit OFFSET :offset
+    """
+
+    db = SessionLocal()
+    try:
+        rows = db.execute(text(sql), params).mappings().all()
+        # 把 feature_val 直接返回为 JSON（已经是 JSONB，mappings() 会给成 dict/str，保险起见再处理一下）
+        items = []
+        for r in rows:
+            fv = r["feature_val"]
+            if isinstance(fv, str):
+                try:
+                    fv = json.loads(fv)
+                except Exception:
+                    pass
+            items.append(
+                {
+                    "id": r["id"],
+                    "entity_type": r["entity_type"],
+                    "entity_id": r["entity_id"],
+                    "tool": r["tool"],
+                    "feature_key": r["feature_key"],
+                    "feature_val": fv,
+                    "tool_version": r["tool_version"],
+                    "source": r["source"],
+                    "confidence": r["confidence"],
+                    "computed_at": r["computed_at"],
+                }
+            )
+        return {"ok": True, "count": len(items), "items": items}
+    finally:
+        db.close()
