@@ -2,15 +2,15 @@
 from __future__ import annotations
 
 import os, json
-from typing import Optional
-
 import httpx
+from typing import Any
+
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
-# === 你的项目内模块 ===
-from common.db import init_db, SessionLocal
+# === 你的项目内模块（注意这里用规范化连接模块） ===
+from db.connection import init_db, SessionLocal
 from models import v5, triad
 from cron import start_scheduler
 
@@ -33,49 +33,50 @@ app = FastAPI(title="Causal-Football v5.0", version="0.0.1")
 
 # ------------------------------------------------------------
 # 自动建表（首次启动 or 表不存在时创建；存在则忽略）
+# 逐条执行，兼容性更稳（使用 exec_driver_sql）
 # ------------------------------------------------------------
-DDL = """
-CREATE TABLE IF NOT EXISTS dpc_ingest_audit (
-    id SERIAL PRIMARY KEY,
-    run_id TEXT,
-    source_id TEXT,
-    entity_type TEXT NOT NULL,
-    entity_id TEXT NOT NULL,
-    action TEXT,
-    confidence FLOAT,
-    signature TEXT,
-    status TEXT,
-    message TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_dpc_ingest_entity
-ON dpc_ingest_audit(entity_type, entity_id);
-
-CREATE TABLE IF NOT EXISTS predictions (
-    id SERIAL PRIMARY KEY,
-    match_id TEXT NOT NULL,
-    model TEXT NOT NULL,
-    payload_json JSONB,
-    result_json JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_predictions_match_model
-ON predictions(match_id, model);
-
-CREATE TABLE IF NOT EXISTS users (
-    id SERIAL PRIMARY KEY,
-    username TEXT UNIQUE,
-    email TEXT UNIQUE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-"""
-
 def init_tables():
     db = SessionLocal()
     try:
-        db.execute(text(DDL))
+        stmts = [
+            """
+            CREATE TABLE IF NOT EXISTS dpc_ingest_audit (
+                id BIGSERIAL PRIMARY KEY,
+                run_id TEXT,
+                source_id TEXT,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                action TEXT,
+                confidence DOUBLE PRECISION,
+                signature TEXT,
+                status TEXT,
+                message TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_dpc_ingest_entity ON dpc_ingest_audit(entity_type, entity_id);",
+            """
+            CREATE TABLE IF NOT EXISTS predictions (
+                id BIGSERIAL PRIMARY KEY,
+                match_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                payload_json JSONB,
+                result_json JSONB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_predictions_match_model ON predictions(match_id, model);",
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY,
+                username TEXT UNIQUE,
+                email TEXT UNIQUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        ]
+        for s in stmts:
+            db.exec_driver_sql(s)
         db.commit()
     finally:
         db.close()
@@ -86,7 +87,7 @@ def init_tables():
 # ------------------------------------------------------------
 @app.get("/healthz")
 def healthz():
-    # 这里保持简洁：能起服务就返回 ok；如需严格校验可以改为检查必需 env
+    # 先保持简洁：能起服务就返回 ok；需要严格校验时再扩展
     return {"status": "ok"}
 
 
@@ -95,14 +96,14 @@ def healthz():
 # ------------------------------------------------------------
 @app.on_event("startup")
 def _startup():
-    init_db()
-    init_tables()
+    init_db()        # 连接字符串规范化 & 引擎/会话创建
+    init_tables()    # 自动建表（幂等）
     if os.getenv("START_SCHEDULER", "true").lower() == "true":
         start_scheduler()
 
 
 # ------------------------------------------------------------
-# 鉴权（仅本文件内接口用；/dpc 与 /admin 内部有各自鉴权）
+# 鉴权（仅本文件内接口用；/dpc 与 /admin 内各自处理鉴权）
 # ------------------------------------------------------------
 def _check_auth(token: str | None):
     if not API_TOKEN:
@@ -119,7 +120,7 @@ class MatchInput(BaseModel):
     home: str
     away: str
     # 可扩展：赔率、伤停、Elo 等
-    features: dict = Field(default_factory=dict)
+    features: dict[str, Any] = Field(default_factory=dict)
 
 class BacktestInput(BaseModel):
     matches: list[MatchInput]
