@@ -1,0 +1,18 @@
+services:
+  api:
+    build:
+      context: ./services/api
+    env_file:
+      - ../.env
+    ports:
+      - "8080:8080"  # 生产建议不开放，走 Cloudflare Tunnel
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./services/worker
+    env_file:
+      - ../.env
+    depends_on:
+      - api
+    restart: unless-stopped
