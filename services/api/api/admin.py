@@ -265,3 +265,113 @@ def feature_get(
     finally:
         db.close()
 
+# --- add below in services/api/api/admin.py ---
+
+from pydantic import BaseModel
+from datetime import datetime
+from sqlalchemy import text
+
+# ===============================
+# feature_runs 批次运行管理接口
+# ===============================
+
+class RunStart(BaseModel):
+    run_id: str
+    tool: str
+    note: str | None = None
+
+@router.post("/run-start", summary="Start a feature run (create or reset)")
+def run_start(payload: RunStart, x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
+    _auth_or_401(x_api_token)
+    db = SessionLocal()
+    try:
+        # 是否已存在
+        row = db.execute(text("SELECT id FROM feature_runs WHERE run_id = :rid LIMIT 1"), {"rid": payload.run_id}).first()
+        if row:
+            db.execute(
+                text("""
+                    UPDATE feature_runs
+                    SET tool=:tool, total=0, ok=0, fail=0, status='running',
+                        note=:note, started_at=NOW(), finished_at=NULL
+                    WHERE run_id=:rid
+                """),
+                {"tool": payload.tool, "note": payload.note, "rid": payload.run_id},
+            )
+            db.commit()
+            return {"ok": True, "id": row[0], "reset": True}
+        else:
+            res = db.execute(
+                text("""
+                    INSERT INTO feature_runs (run_id, tool, total, ok, fail, status, note, started_at)
+                    VALUES (:rid, :tool, 0, 0, 0, 'running', :note, NOW())
+                    RETURNING id
+                """),
+                {"rid": payload.run_id, "tool": payload.tool, "note": payload.note},
+            )
+            new_id = res.scalar()
+            db.commit()
+            return {"ok": True, "id": int(new_id), "reset": False}
+    finally:
+        db.close()
+
+
+class RunFinish(BaseModel):
+    run_id: str
+    ok: int = 0
+    fail: int = 0
+    status: str = "finished"   # 'finished' / 'failed' / 'partial' 等
+    note: str | None = None
+
+@router.post("/run-finish", summary="Finish a feature run (update stats)")
+def run_finish(payload: RunFinish, x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
+    _auth_or_401(x_api_token)
+    db = SessionLocal()
+    try:
+        result = db.execute(
+            text("""
+                UPDATE feature_runs
+                   SET ok=:ok, fail=:fail, status=:status,
+                       note=COALESCE(:note, note), finished_at=NOW()
+                 WHERE run_id=:rid
+            """),
+            {"ok": payload.ok, "fail": payload.fail, "status": payload.status, "note": payload.note, "rid": payload.run_id},
+        )
+        db.commit()
+        return {"ok": True, "updated": result.rowcount}
+    finally:
+        db.close()
+
+
+@router.get("/run-get", summary="Get feature run records")
+def run_get(
+    run_id: Optional[str] = None,
+    tool: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
+):
+    _auth_or_401(x_api_token)
+    db = SessionLocal()
+    try:
+        conds = []
+        params = {"limit": limit, "offset": offset}
+        if run_id:
+            conds.append("run_id = :rid")
+            params["rid"] = run_id
+        if tool:
+            conds.append("tool = :tool")
+            params["tool"] = tool
+        where_sql = ("WHERE " + " AND ".join(conds)) if conds else ""
+        rows = db.execute(
+            text(f"""
+                SELECT id, run_id, tool, total, ok, fail, status, note, started_at, finished_at
+                  FROM feature_runs
+                {where_sql}
+                ORDER BY id DESC
+                LIMIT :limit OFFSET :offset
+            """),
+            params,
+        ).mappings().all()
+        return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
+    finally:
+        db.close()
