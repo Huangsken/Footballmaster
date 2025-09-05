@@ -15,7 +15,9 @@ def healthz():
     }
     if all(required.values()):
         return {"status": "ok", "env": settings.ENV, "tz": settings.TIMEZONE}
-    raise HTTPException(
-        status_code=500,
-        detail={"status": "env-missing", "fields": [k for k, v in required.items() if not v]},
-    )
+    # 即使缺项，也让应用活着；把缺的列出来
+    return {"status": "degraded", "missing": [k for k, v in required.items() if not v]}
+
+# === 挂载管理路由 ===
+from api.admin import router as admin_router  # noqa: E402
+app.include_router(admin_router)
