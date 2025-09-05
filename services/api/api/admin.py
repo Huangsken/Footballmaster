@@ -1,10 +1,11 @@
 # services/api/api/admin.py
 from __future__ import annotations
 
-import os
-from typing import Optional
+import os, json
+from typing import Optional, List
 
 from fastapi import APIRouter, Header, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from common.notify import tg_send
@@ -13,6 +14,7 @@ try:
     from common.db import engine as db_engine
 except Exception:
     from db.connection import engine as db_engine  # fallback
+
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 API_TOKEN = os.getenv("API_SHARED_TOKEN", "").strip()
@@ -29,7 +31,45 @@ def _auth_or_401(token: Optional[str]):
 
 
 # ----------------------
-# Test Telegram
+# Pydantic models（特征写入 & 运行记录）
+# ----------------------
+class FeatureLogInput(BaseModel):
+    """单条工具特征写入"""
+    entity_type: str
+    entity_id: str
+    tool: str
+    feature_key: str
+    feature_val: dict = Field(default_factory=dict)
+    tool_version: str
+    source: Optional[str] = None
+    confidence: Optional[float] = None
+    computed_at: Optional[str] = None  # ISO 时间字符串（可选）
+
+
+class FeatureBulkInput(BaseModel):
+    """批量工具特征写入"""
+    items: List[FeatureLogInput] = Field(min_length=1, max_length=1000)
+    run_id: Optional[str] = None
+    dry_run: bool = False
+
+
+class RunStartInput(BaseModel):
+    run_id: str
+    tool: str
+    note: Optional[str] = None
+
+
+class RunFinishInput(BaseModel):
+    run_id: str
+    total: int
+    ok: int
+    fail: int
+    status: str = "finished"
+    note: Optional[str] = None
+
+
+# ----------------------
+# Telegram 测试
 # ----------------------
 @router.post("/test-tg", summary="Test Telegram Bot")
 def test_tg(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
@@ -39,7 +79,7 @@ def test_tg(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token
 
 
 # ----------------------
-# Check DB connectivity
+# DB 连接性检查
 # ----------------------
 @router.post("/db-check", summary="Check DB connectivity")
 def db_check(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
@@ -53,9 +93,10 @@ def db_check(x_api_token: Optional[str] = Header(default=None, alias="X-API-Toke
 
 
 # ----------------------
-# Init DB schema
+# 初始化 schema（可幂等）
 # ----------------------
 DDL_STATEMENTS: list[str] = [
+    # dpc_ingest_audit
     """
     CREATE TABLE IF NOT EXISTS dpc_ingest_audit (
         id BIGSERIAL PRIMARY KEY,
@@ -72,6 +113,8 @@ DDL_STATEMENTS: list[str] = [
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_dpc_ingest_entity ON dpc_ingest_audit(entity_type, entity_id);",
+
+    # predictions
     """
     CREATE TABLE IF NOT EXISTS predictions (
         id BIGSERIAL PRIMARY KEY,
@@ -83,6 +126,8 @@ DDL_STATEMENTS: list[str] = [
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_predictions_match_model ON predictions(match_id, model);",
+
+    # users
     """
     CREATE TABLE IF NOT EXISTS users (
         id BIGSERIAL PRIMARY KEY,
@@ -91,6 +136,8 @@ DDL_STATEMENTS: list[str] = [
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """,
+
+    # tool_features
     """
     CREATE TABLE IF NOT EXISTS tool_features (
         id BIGSERIAL PRIMARY KEY,
@@ -108,6 +155,8 @@ DDL_STATEMENTS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_tool_features_entity ON tool_features(entity_type, entity_id);",
     "CREATE INDEX IF NOT EXISTS idx_tool_features_tool   ON tool_features(tool);",
     "CREATE INDEX IF NOT EXISTS idx_tool_features_key    ON tool_features(feature_key);",
+
+    # feature_runs
     """
     CREATE TABLE IF NOT EXISTS feature_runs (
         id BIGSERIAL PRIMARY KEY,
@@ -123,6 +172,8 @@ DDL_STATEMENTS: list[str] = [
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_feature_runs_run ON feature_runs(run_id);",
+
+    # experiments（保留）
     """
     CREATE TABLE IF NOT EXISTS experiments (
         id BIGSERIAL PRIMARY KEY,
@@ -147,38 +198,191 @@ def init_db_stub(x_api_token: Optional[str] = Header(default=None, alias="X-API-
 
 
 # ----------------------
-# Run Finish 更新
+# 单条特征写入
 # ----------------------
+@router.post("/feature-log", summary="Log one tool feature")
+def feature_log(
+    body: FeatureLogInput,
+    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
+):
+    _auth_or_401(x_api_token)
+    db = SessionLocal()
+    try:
+        db.execute(
+            text("""
+                INSERT INTO tool_features (
+                    entity_type, entity_id, tool, feature_key, feature_val,
+                    tool_version, source, confidence, computed_at
+                ) VALUES (
+                    :entity_type, :entity_id, :tool, :feature_key, :feature_val::jsonb,
+                    :tool_version, :source, :confidence,
+                    COALESCE(:computed_at, CURRENT_TIMESTAMP)
+                )
+            """),
+            {
+                "entity_type": body.entity_type,
+                "entity_id": body.entity_id,
+                "tool": body.tool,
+                "feature_key": body.feature_key,
+                "feature_val": json.dumps(body.feature_val, ensure_ascii=False),
+                "tool_version": body.tool_version,
+                "source": body.source,
+                "confidence": body.confidence,
+                "computed_at": body.computed_at,
+            },
+        )
+        db.commit()
+        new_id = db.execute(text("SELECT currval(pg_get_serial_sequence('tool_features','id'))")).scalar()
+        return {"ok": True, "id": int(new_id) if new_id else None}
+    finally:
+        db.close()
+
+
+# ----------------------
+# 批量特征写入
+# ----------------------
+@router.post("/feature-bulk-log", summary="Bulk log tool features")
+def feature_bulk_log(
+    body: FeatureBulkInput,
+    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
+):
+    _auth_or_401(x_api_token)
+
+    if body.dry_run:
+        # 只做验证，不落库
+        return {"ok": True, "dry_run": True, "count": len(body.items)}
+
+    db = SessionLocal()
+    inserted = 0
+    try:
+        for item in body.items:
+            db.execute(
+                text("""
+                    INSERT INTO tool_features (
+                        entity_type, entity_id, tool, feature_key, feature_val,
+                        tool_version, source, confidence, computed_at
+                    ) VALUES (
+                        :entity_type, :entity_id, :tool, :feature_key, :feature_val::jsonb,
+                        :tool_version, :source, :confidence,
+                        COALESCE(:computed_at, CURRENT_TIMESTAMP)
+                    )
+                """),
+                {
+                    "entity_type": item.entity_type,
+                    "entity_id": item.entity_id,
+                    "tool": item.tool,
+                    "feature_key": item.feature_key,
+                    "feature_val": json.dumps(item.feature_val, ensure_ascii=False),
+                    "tool_version": item.tool_version,
+                    "source": item.source,
+                    "confidence": item.confidence,
+                    "computed_at": item.computed_at,
+                },
+            )
+            inserted += 1
+
+        # 如果带 run_id，则把 ok 累加到该 run（不改变状态）
+        if body.run_id:
+            db.execute(
+                text("""
+                    UPDATE feature_runs
+                    SET ok = ok + :ok, total = total + :total
+                    WHERE run_id = :run_id
+                """),
+                {"ok": inserted, "total": inserted, "run_id": body.run_id},
+            )
+
+        db.commit()
+        return {"ok": True, "inserted": inserted}
+    finally:
+        db.close()
+
+
+# ----------------------
+# 查询特征
+# ----------------------
+@router.get("/feature-get", summary="Get tool features")
+def feature_get(
+    entity_type: str,
+    entity_id: str,
+    tool: Optional[str] = None,
+    feature_key: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
+):
+    _auth_or_401(x_api_token)
+    sql = """
+        SELECT id, entity_type, entity_id, tool, feature_key, feature_val,
+               tool_version, source, confidence, computed_at
+        FROM tool_features
+        WHERE entity_type = :entity_type AND entity_id = :entity_id
+    """
+    params = {"entity_type": entity_type, "entity_id": entity_id}
+    if tool:
+        sql += " AND tool = :tool"
+        params["tool"] = tool
+    if feature_key:
+        sql += " AND feature_key = :feature_key"
+        params["feature_key"] = feature_key
+    sql += " ORDER BY id DESC LIMIT :limit OFFSET :offset"
+    params.update({"limit": limit, "offset": offset})
+
+    db = SessionLocal()
+    try:
+        rows = db.execute(text(sql), params).mappings().all()
+        return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
+    finally:
+        db.close()
+
+
+# ----------------------
+# 运行记录：开始 / 结束 / 查询
+# ----------------------
+@router.post("/run-start", summary="Start a feature run")
+def run_start(
+    body: RunStartInput,
+    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
+):
+    _auth_or_401(x_api_token)
+    db = SessionLocal()
+    try:
+        db.execute(
+            text("""
+                INSERT INTO feature_runs (run_id, tool, status, note)
+                VALUES (:run_id, :tool, 'running', :note)
+                ON CONFLICT (run_id) DO NOTHING
+            """),
+            {"run_id": body.run_id, "tool": body.tool, "note": body.note},
+        )
+        db.commit()
+        return {"ok": True, "run_id": body.run_id}
+    finally:
+        db.close()
+
+
 @router.post("/run-finish", summary="Finish a feature run")
-def run_finish(body: dict, x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
-    """
-    更新 feature_runs 的执行结果。
-    body 示例:
-    {
-        "run_id": "run-20250906-001",
-        "total": 39,
-        "ok": 37,
-        "fail": 2,
-        "status": "finished",
-        "note": "zodiac degrees computed for EPL-2025-01"
-    }
-    """
+def run_finish(
+    body: RunFinishInput,
+    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
+):
     _auth_or_401(x_api_token)
     db = SessionLocal()
     try:
         db.execute(
             text("""
                 UPDATE feature_runs
-                SET total=:total, ok=:ok, fail=:fail, status=:status, note=:note, finished_at=NOW()
-                WHERE run_id=:run_id
+                SET total = :total, ok = :ok, fail = :fail,
+                    status = :status, note = :note, finished_at = CURRENT_TIMESTAMP
+                WHERE run_id = :run_id
             """),
             {
-                "run_id": body.get("run_id"),
-                "total": body.get("total", 0),
-                "ok": body.get("ok", 0),
-                "fail": body.get("fail", 0),
-                "status": body.get("status", "finished"),
-                "note": body.get("note", ""),
+                "run_id": body.run_id,
+                "total": body.total,
+                "ok": body.ok,
+                "fail": body.fail,
+                "status": body.status,
+                "note": body.note,
             },
         )
         db.commit()
@@ -186,124 +390,28 @@ def run_finish(body: dict, x_api_token: Optional[str] = Header(default=None, ali
     finally:
         db.close()
 
-@router.get("/run-get", summary="List feature run records")
+
+@router.get("/run-get", summary="Get feature run")
 def run_get(
-    run_id: Optional[str] = None,
-    tool: Optional[str] = None,
+    run_id: str,
     limit: int = 100,
     offset: int = 0,
     x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
 ):
-    """
-    查询 feature_runs 记录。
-    - 可选过滤：run_id, tool
-    - 分页：limit, offset
-    返回字段：id, run_id, tool, total, ok, fail, status, note, started_at, finished_at
-    """
     _auth_or_401(x_api_token)
     db = SessionLocal()
     try:
-        clauses, params = [], {}
-        if run_id:
-            clauses.append("run_id = :run_id")
-            params["run_id"] = run_id
-        if tool:
-            clauses.append("tool = :tool")
-            params["tool"] = tool
-        where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-
-        sql = f"""
-        SELECT id, run_id, tool, total, ok, fail, status, note,
-               started_at, finished_at
-        FROM feature_runs
-        {where_sql}
-        ORDER BY started_at DESC NULLS LAST
-        LIMIT :limit OFFSET :offset
-        """
-        params["limit"] = limit
-        params["offset"] = offset
-
-        rows = db.execute(text(sql), params).mappings().all()
-        return {
-            "ok": True,
-            "count": len(rows),
-            "items": [dict(r) for r in rows],
-        }
-    finally:
-        db.close()
-
-# ----------------------
-# Bulk Feature log（批量写入 tool_features）
-# ----------------------
-from pydantic import BaseModel, Field
-from typing import List
-import json
-from sqlalchemy import text
-
-# 复用单条的 FeatureLogInput；如你文件里未定义，可取消注释下面的定义
-# class FeatureLogInput(BaseModel):
-#     entity_type: str
-#     entity_id: str
-#     tool: str
-#     feature_key: str
-#     feature_val: dict = Field(default_factory=dict)
-#     tool_version: str
-#     source: str | None = None
-#     confidence: float | None = None
-#     computed_at: str | None = None
-
-class FeatureBulkInput(BaseModel):
-    items: List[FeatureLogInput] = Field(min_length=1, max_length=1000)
-    run_id: str | None = None      # 可选：关联一次批次，自动更新 feature_runs 计数
-    dry_run: bool = False          # 只校验不落库（用于先看一眼）
-
-@router.post("/feature-bulk-log", summary="Bulk insert tool_features (with optional run_id aggregation)")
-def feature_bulk_log(payload: FeatureBulkInput,
-                     x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
-    _auth_or_401(x_api_token)
-
-    rows = []
-    for it in payload.items:
-        rows.append({
-            "entity_type": it.entity_type,
-            "entity_id": it.entity_id,
-            "tool": it.tool,
-            "feature_key": it.feature_key,
-            "feature_val": json.dumps(it.feature_val or {}, ensure_ascii=False),
-            "tool_version": it.tool_version,
-            "source": it.source,
-            "confidence": it.confidence,
-            "computed_at": it.computed_at,
-        })
-
-    if payload.dry_run:
-        return {"ok": True, "dry_run": True, "to_insert": len(rows)}
-
-    db = SessionLocal()
-    try:
-        # 批量 INSERT
-        insert_sql = text("""
-            INSERT INTO tool_features
-                (entity_type, entity_id, tool, feature_key, feature_val,
-                 tool_version, source, confidence, computed_at)
-            VALUES
-                (:entity_type, :entity_id, :tool, :feature_key, :feature_val,
-                 :tool_version, :source, :confidence,
-                 COALESCE(CAST(:computed_at AS TIMESTAMP), CURRENT_TIMESTAMP))
-        """)
-        db.execute(insert_sql, rows)
-
-        # 可选：更新 feature_runs 统计
-        if payload.run_id:
-            agg_sql = text("""
-                UPDATE feature_runs
-                   SET total = COALESCE(total,0) + :delta,
-                       ok    = COALESCE(ok,0)    + :delta
-                 WHERE run_id = :rid
-            """)
-            db.execute(agg_sql, {"delta": len(rows), "rid": payload.run_id})
-
-        db.commit()
-        return {"ok": True, "inserted": len(rows), "run_id": payload.run_id}
+        rows = db.execute(
+            text("""
+                SELECT id, run_id, tool, total, ok, fail, status, note,
+                       started_at, finished_at
+                FROM feature_runs
+                WHERE run_id = :run_id
+                ORDER BY id DESC
+                LIMIT :limit OFFSET :offset
+            """),
+            {"run_id": run_id, "limit": limit, "offset": offset},
+        ).mappings().all()
+        return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
     finally:
         db.close()
