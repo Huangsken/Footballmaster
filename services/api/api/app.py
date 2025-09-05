@@ -154,29 +154,41 @@ async def _call_http(endpoint: str, payload: dict):
         r.raise_for_status()
         return r.json()
 
-def _save_prediction(match_id: str, model: str, payload: dict, result: dict):
+from sqlalchemy import text, bindparam
+from sqlalchemy.dialects.postgresql import JSONB
+
+def _save_prediction(match_id: str, model: str, payload: dict, result: dict) -> None:
     """
-    将预测落库到 predictions；仅尝试，不把异常抛到上层，避免影响接口返回。
-    使用 PgJson 确保 JSONB 正确传入。
+    稳定地把预测写入 predictions 表：
+    - 使用 PostgreSQL JSONB 类型绑定，避免 JSON 序列化/适配器问题
+    - 任何异常都会被捕获并记录，不会让 /predict 接口 500
     """
     db = SessionLocal()
     try:
+        stmt = (
+            text("""
+                INSERT INTO predictions (match_id, model, payload_json, result_json)
+                VALUES (:m, :model, :p, :r)
+            """)
+            .bindparams(
+                bindparam("p", type_=JSONB),
+                bindparam("r", type_=JSONB),
+            )
+        )
+
         db.execute(
-            text(
-                "INSERT INTO predictions (match_id, model, payload_json, result_json) "
-                "VALUES (:m, :model, :p, :r)"
-            ),
+            stmt,
             {
                 "m": match_id,
                 "model": model,
-                "p": PgJson(payload),  # ✅ 关键：让驱动按 JSON 传递
-                "r": PgJson(result),   # ✅
+                "p": payload,
+                "r": result,
             },
         )
         db.commit()
-    except Exception:
-        logger.exception("save_prediction failed")
-        # 不向上抛，让接口仍然返回预测结果
+    except Exception as e:
+        print(f"[warn] save_prediction failed: {e}")
+        db.rollback()
     finally:
         db.close()
 
