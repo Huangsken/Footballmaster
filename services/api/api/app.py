@@ -21,8 +21,15 @@ def healthz():
         else {"status": "degraded", "missing": [k for k, v in required.items() if not v]}
     )
 
-# === 这里挂载管理路由（一定要有这两行） ===
+
+# ==============================
+# 挂载子路由
+# ==============================
+
+# 管理接口 (/admin/...)
 from api.admin import router as admin_router  # noqa: E402
 app.include_router(admin_router)
-from api.dpc import router as dpc_router      # ✅ 新增
+
+# 数据采集/因果接口 (/dpc/...)
+from api.dpc import router as dpc_router      # noqa: E402
 app.include_router(dpc_router)
