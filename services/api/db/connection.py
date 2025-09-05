@@ -14,7 +14,7 @@ def get_engine() -> Engine:
         _engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
     return _engine
 
-def exec_sql(sql: str) -> None:
+def exec_sql(sql: str, **params) -> None:
     engine = get_engine()
     with engine.begin() as conn:
-        conn.execute(text(sql))
+        conn.execute(text(sql), params)
