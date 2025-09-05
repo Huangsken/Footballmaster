@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Header, HTTPException
 from app.config import settings
-from ..db.init_db import run_schema
+from db.init_db import run_schema
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
