@@ -24,3 +24,5 @@ def healthz():
 # === 这里挂载管理路由（一定要有这两行） ===
 from api.admin import router as admin_router  # noqa: E402
 app.include_router(admin_router)
+from api.dpc import router as dpc_router      # ✅ 新增
+app.include_router(dpc_router)
