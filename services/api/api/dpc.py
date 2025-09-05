@@ -1,3 +1,4 @@
+from common.uid import make_player_uid, make_coach_uid, make_ref_uid, detect_conflicts
 from db.connection import exec_sql
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -87,27 +88,65 @@ def ingest(batch: IngestBatch, x_ingest_token: Optional[str] = Header(default=No
     _auth_or_403(x_ingest_token)
     now = time.time()
 
-    results = []
-    to_insert = []
-
+    # 先标准化 entity_id（按 UID 规则补齐）
+    normalized_items: List[IngestItem] = []
     for it in batch.items:
         if it.snapshot_ts is None:
             it.snapshot_ts = now
+        # 若 entity_id 缺失或不是规范前缀，则尝试基于 payload 生成
+        eid = it.entity_id.strip()
+        if it.entity_type == "player" and not eid.startswith("plr_"):
+            eid = make_player_uid(
+                provider=it.payload.get("provider"),
+                provider_player_id=it.payload.get("provider_player_id") or it.payload.get("provider_id"),
+                name=it.payload.get("name"),
+                birth_date=it.payload.get("birth_date"),
+            )
+            it.entity_id = eid
+        elif it.entity_type == "coach" and not eid.startswith("coach_"):
+            it.entity_id = make_coach_uid(
+                provider=it.payload.get("provider"),
+                provider_id=it.payload.get("provider_id"),
+                name=it.payload.get("name"),
+                birth_date=it.payload.get("birth_date"),
+            )
+        elif it.entity_type == "referee" and not eid.startswith("ref_"):
+            it.entity_id = make_ref_uid(
+                provider=it.payload.get("provider"),
+                provider_id=it.payload.get("provider_id"),
+                name=it.payload.get("name"),
+                birth_date=it.payload.get("birth_date"),
+            )
+        normalized_items.append(it)
+
+    # 简单校验 & 结果汇总
+    results = []
+    to_insert = []
+    for it in normalized_items:
         res = _validate_item(it)
-        result_row = {
+        results.append({
             "entity_type": it.entity_type,
             "entity_id": it.entity_id,
             "schema": f"{it.schema_name}@{it.schema_version}",
             "status": res["status"],
             "message": res["message"],
-        }
-        results.append(result_row)
-
-        # 如果状态是 accepted 并且不是 dry_run，则准备入库
+        })
         if res["status"] == "accepted" and not batch.dry_run:
             to_insert.append(it)
 
-    # === 执行入库 ===
+    # 批内冲突检测（只做标注，不改变已计算的 status；由 overall 反映严重度）
+    marks = detect_conflicts([{"entity_type": it.entity_type, "entity_id": it.entity_id, "payload": it.payload} for it in normalized_items])
+    for r in results:
+        if r["entity_id"] in marks:
+            tag = marks[r["entity_id"]]
+            # 提升严重度：block > warn > accepted
+            if tag.startswith("block"):
+                r["status"] = "block"
+            elif tag.startswith("warn") and r["status"] == "accepted":
+                r["status"] = "warn"
+            r["message"] = (r["message"] + f" | {tag}") if r["message"] else tag
+
+    # 真写库（仅 accepted & 非 dry_run）
     inserted = 0
     if to_insert:
         sql = """
