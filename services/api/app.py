@@ -16,6 +16,14 @@ from cron import start_scheduler
 app = FastAPI()
 init_db()
 
+@app.get("/")
+def root():
+    return {"message": "FootballMaster API is running!"}
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
 @app.on_event("startup")
 def _startup():
     import os
