@@ -8,6 +8,7 @@ COPY ./requirements.txt /app/requirements.txt
 
 # 2) 安装依赖
 RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN python -c "import requests; print('requests module check passed')"
 
 # 3) 复制代码
 COPY services/api/app.py   /app/app.py
