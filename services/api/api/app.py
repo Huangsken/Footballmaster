@@ -1,13 +1,21 @@
 # services/api/api/app.py
 from __future__ import annotations
 
-import os, json
+import os
+import json
+import logging
 from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import text
+from psycopg2.extras import Json as PgJson  # ✅ 用于 JSONB 安全插入
+
+# === 日志 & 开关 ===
+logger = logging.getLogger("api")
+logging.basicConfig(level=logging.INFO)
+SAVE_PREDICTIONS = os.getenv("SAVE_PREDICTIONS", "true").lower() == "true"
 
 # === 你项目里的数据库工具 ===
 #   SessionLocal：用于事务/ORM
@@ -17,7 +25,7 @@ try:
     # 大多数仓库里 engine 在 common.db
     from common.db import engine as db_engine
 except Exception:
-    # 你的 dpc.py 使用的是 db.connection；做个兜底，二选一即可
+    # dpc.py 里也可能从 db.connection 拿 engine；兜底
     from db.connection import engine as db_engine  # type: ignore
 
 # === 你现有模块 ===
@@ -147,12 +155,16 @@ async def _call_http(endpoint: str, payload: dict):
         return r.json()
 
 def _save_prediction(match_id: str, model: str, payload: dict, result: dict):
+    """
+    将预测落库到 predictions；仅尝试，不把异常抛到上层，避免影响接口返回。
+    使用 PgJson 确保 JSONB 正确传入。
+    """
     db = SessionLocal()
     try:
         db.execute(
             text(
                 "INSERT INTO predictions (match_id, model, payload_json, result_json) "
-                "VALUES (:m,:model,:p,:r)"
+                "VALUES (:m, :model, :p, :r)"
             ),
             {
                 "m": match_id,
@@ -162,6 +174,9 @@ def _save_prediction(match_id: str, model: str, payload: dict, result: dict):
             },
         )
         db.commit()
+    except Exception:
+        logger.exception("save_prediction failed")
+        # 不向上抛，让接口仍然返回预测结果
     finally:
         db.close()
 
@@ -198,7 +213,13 @@ async def predict(payload: MatchInput, model: str = "v5", x_api_token: str | Non
         else:
             res = v5.combine_with_triad(v5.predict(data), triad.predict(data))
 
-    _save_prediction(payload.match_id, sel, data, res)
+    # 可选写库；失败不影响响应
+    if SAVE_PREDICTIONS:
+        try:
+            _save_prediction(payload.match_id, sel, data, res)
+        except Exception:
+            logger.exception("SAVE_PREDICTIONS=True but save failed")
+
     return {"match_id": payload.match_id, "home": payload.home, "away": payload.away, **res}
 
 
