@@ -3,6 +3,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 import httpx
 from sqlalchemy import text
+from typing import Optional
 
 from common.db import init_db, SessionLocal
 
@@ -17,11 +18,10 @@ from models import v5, triad
 from cron import start_scheduler
 
 # === 新增：挂载 dpc 与 admin 路由 ===
-# 这些文件已在 services/api/api/ 目录下由我们提前准备好
 from api.dpc import router as dpc_router
 from api.admin import router as admin_router
 
-app = FastAPI()
+app = FastAPI(title="Causal-Football v5.0", version="0.0.1")
 init_db()
 
 @app.get("/")
@@ -37,14 +37,14 @@ def _startup():
     if os.getenv("START_SCHEDULER", "true").lower() == "true":
         start_scheduler()
 
-# 统一鉴权（供本文件内接口使用；dpc/admin 自带各自的鉴权逻辑）
-def _check_auth(token: str | None):
+# 统一鉴权（供本文件内接口使用；dpc/admin 自带各自鉴权）
+def _check_auth(token: Optional[str]):
     if not API_TOKEN:
         return
     if not token or token != API_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
 
-# ==== 你原有的数据模型 ====
+# ==== 输入模型 ====
 class MatchInput(BaseModel):
     match_id: str
     home: str
@@ -54,12 +54,8 @@ class MatchInput(BaseModel):
 
 class BacktestInput(BaseModel):
     matches: list[MatchInput]
-    # 可选：目标指标定义
 
-class ChatInput(BaseModel):
-    messages: list[dict]
-
-# ==== 工具函数 ====
+# ==== 工具 ====
 async def _call_http(endpoint: str, payload: dict):
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(endpoint, json=payload)
@@ -70,16 +66,11 @@ def _save_prediction(match_id: str, model: str, payload: dict, result: dict):
     db = SessionLocal()
     try:
         db.execute(
-            text(
-                "INSERT INTO predictions (match_id, model, payload_json, result_json) "
-                "VALUES (:m,:model,:p,:r)"
-            ),
-            {
-                "m": match_id,
-                "model": model,
-                "p": json.dumps(payload, ensure_ascii=False),
-                "r": json.dumps(result, ensure_ascii=False),
-            },
+            text("INSERT INTO predictions (match_id, model, payload_json, result_json) "
+                 "VALUES (:m,:model,:p,:r)"),
+            {"m": match_id, "model": model,
+             "p": json.dumps(payload, ensure_ascii=False),
+             "r": json.dumps(result, ensure_ascii=False)}
         )
         db.commit()
     finally:
@@ -91,9 +82,13 @@ def _select_model(model: str):
         raise HTTPException(status_code=400, detail="model must be v5|triad|ensemble")
     return m
 
-# ==== 你原有的接口：/predict ====
+# ==== 1) 单场预测 ====
 @app.post("/predict")
-async def predict(payload: MatchInput, model: str = "v5", x_api_token: str | None = Header(default=None)):
+async def predict(
+    payload: MatchInput,
+    model: str = "v5",
+    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")
+):
     _check_auth(x_api_token)
     sel = _select_model(model)
     data = payload.model_dump()
@@ -118,22 +113,24 @@ async def predict(payload: MatchInput, model: str = "v5", x_api_token: str | Non
     _save_prediction(payload.match_id, sel, data, res)
     return {"match_id": payload.match_id, "home": payload.home, "away": payload.away, **res}
 
-# ==== 你原有的接口：/scores/top3 ====
+# ==== 2) 比分 Top3 ====
 @app.post("/scores/top3")
-async def top3_scores(payload: MatchInput, model: str = "v5", x_api_token: str | None = Header(default=None)):
+async def top3_scores(
+    payload: MatchInput,
+    model: str = "v5",
+    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")
+):
     _check_auth(x_api_token)
     sel = _select_model(model)
     data = payload.model_dump()
 
     if CALL_MODE == "http":
-        endpoint = ENDPOINT_V5 if sel == "v5" else ENDPOINT_TRIAD
         if sel == "ensemble":
             r1 = await _call_http(ENDPOINT_V5, data)
             r2 = await _call_http(ENDPOINT_TRIAD, data)
             res = v5.top3_from_combined(v5.combine_with_triad(r1, r2))
         else:
-            # 远端需返回胜平负+比分分布；若无，则在本地基于总概率构造（示例）
-            r = await _call_http(endpoint, data)
+            r = await _call_http(ENDPOINT_V5 if sel == "v5" else ENDPOINT_TRIAD, data)
             res = v5.derive_top3_from_result(r)
     else:
         if sel == "v5":
@@ -146,32 +143,34 @@ async def top3_scores(payload: MatchInput, model: str = "v5", x_api_token: str |
             )
     return {"match_id": payload.match_id, "home": payload.home, "away": payload.away, **res}
 
-# ==== 你原有的接口：/backtest ====
+# ==== 3) 简易回测（胜平负准确率） ====
 @app.post("/backtest")
-def backtest(payload: BacktestInput, x_api_token: str | None = Header(default=None)):
+def backtest(
+    payload: BacktestInput,
+    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")
+):
     _check_auth(x_api_token)
-    # 简化：示例回测（胜平负准确率）
-    # 期望 payload.matches[i].features 中含真实结果 "ft_result": "H|D|A"
     total, hit = 0, 0
     for m in payload.matches:
         total += 1
         r = v5.predict(m.model_dump())  # 默认用 v5；可按需扩展
         probs = r.get("probs", {})
         pred = max(probs, key=probs.get) if probs else None
-        truth = (m.features or {}).get("ft_result")
+        truth = (m.features or {}).get("ft_result")  # H|D|A
         if pred and truth:
-            label = {"home_win": "H", "draw": "D", "away_win": "A"}[pred]
+            label = {"home_win":"H","draw":"D","away_win":"A"}[pred]
             if label == truth:
                 hit += 1
-    acc = hit / total if total else 0.0
+    acc = hit/total if total else 0.0
     return {"total": total, "hit": hit, "acc": round(acc, 4)}
 
-# ==== 你原有的接口：/assistant ====
+# ==== Assistant（可选） ====
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini").strip()
 
 @app.post("/assistant")
-async def assistant(payload: dict, x_api_token: str | None = Header(default=None)):
+async def assistant(payload: dict,
+                    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
     _check_auth(x_api_token)
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="assistant not configured")
@@ -182,6 +181,6 @@ async def assistant(payload: dict, x_api_token: str | None = Header(default=None
         r.raise_for_status()
         return r.json()
 
-# ==== 新增：挂载 dpc / admin 路由（/dpc/* 与 /admin/*） ====
+# ==== 路由挂载（/dpc/* 与 /admin/*） ====
 app.include_router(dpc_router)
 app.include_router(admin_router)
