@@ -185,3 +185,49 @@ def run_finish(body: dict, x_api_token: Optional[str] = Header(default=None, ali
         return {"ok": True, "updated": 1}
     finally:
         db.close()
+
+@router.get("/run-get", summary="List feature run records")
+def run_get(
+    run_id: Optional[str] = None,
+    tool: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
+):
+    """
+    查询 feature_runs 记录。
+    - 可选过滤：run_id, tool
+    - 分页：limit, offset
+    返回字段：id, run_id, tool, total, ok, fail, status, note, started_at, finished_at
+    """
+    _auth_or_401(x_api_token)
+    db = SessionLocal()
+    try:
+        clauses, params = [], {}
+        if run_id:
+            clauses.append("run_id = :run_id")
+            params["run_id"] = run_id
+        if tool:
+            clauses.append("tool = :tool")
+            params["tool"] = tool
+        where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+        sql = f"""
+        SELECT id, run_id, tool, total, ok, fail, status, note,
+               started_at, finished_at
+        FROM feature_runs
+        {where_sql}
+        ORDER BY started_at DESC NULLS LAST
+        LIMIT :limit OFFSET :offset
+        """
+        params["limit"] = limit
+        params["offset"] = offset
+
+        rows = db.execute(text(sql), params).mappings().all()
+        return {
+            "ok": True,
+            "count": len(rows),
+            "items": [dict(r) for r in rows],
+        }
+    finally:
+        db.close()
