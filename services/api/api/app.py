@@ -1,58 +1,45 @@
-# services/api/api/app.py
 from __future__ import annotations
 
-import os
-import json
-import logging
+import os, json
 from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import text
-from psycopg2.extras import Json as PgJson  # ✅ 用于 JSONB 安全插入
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 
-# === 日志 & 开关 ===
-logger = logging.getLogger("api")
-logging.basicConfig(level=logging.INFO)
-SAVE_PREDICTIONS = os.getenv("SAVE_PREDICTIONS", "true").lower() == "true"
-
-# === 你项目里的数据库工具 ===
-#   SessionLocal：用于事务/ORM
-#   engine：用于执行 DDL（建表等）
 from common.db import init_db, SessionLocal
 try:
-    # 大多数仓库里 engine 在 common.db
     from common.db import engine as db_engine
 except Exception:
-    # dpc.py 里也可能从 db.connection 拿 engine；兜底
     from db.connection import engine as db_engine  # type: ignore
 
-# === 你现有模块 ===
 from models import v5, triad
 from cron import start_scheduler
-
-# 子路由（已在 services/api/api/ 下准备好）
 from api.dpc import router as dpc_router
 from api.admin import router as admin_router
 
-# === 环境变量 ===
 API_TOKEN = os.getenv("API_SHARED_TOKEN", "")
-CALL_MODE = os.getenv("MODEL_CALL_MODE", "local").lower()          # local | http
+CALL_MODE = os.getenv("MODEL_CALL_MODE", "local").lower()
 ENDPOINT_V5 = os.getenv("MODEL_ENDPOINT_V5", "").strip()
 ENDPOINT_TRIAD = os.getenv("MODEL_ENDPOINT_TRIAD", "").strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-5-mini").strip()
 
-# === FastAPI 应用 ===
 app = FastAPI(title="Causal-Football v5.0", version="0.0.1")
 
+# === CORS 允许跨域 ===
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],      # ⚠️ 可改成 ["https://your-frontend.example"]
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# ------------------------------------------------------------
-# 自动建表（首次启动 or 表不存在时创建；存在则忽略）
-#   注意：DDL 要用 engine/connection 来执行，而不是 Session
-# ------------------------------------------------------------
+# === 自动建表 ===
 DDL_STATEMENTS: list[str] = [
     """
     CREATE TABLE IF NOT EXISTS dpc_ingest_audit (
@@ -92,50 +79,33 @@ DDL_STATEMENTS: list[str] = [
 ]
 
 def init_tables() -> None:
-    # 用 engine 建连接，逐条执行 DDL
     with db_engine.begin() as conn:
         for sql in DDL_STATEMENTS:
             conn.exec_driver_sql(sql)
 
-
-# ------------------------------------------------------------
-# 健康检查
-# ------------------------------------------------------------
 @app.get("/healthz")
 def healthz():
-    # 能起服务就返回 ok；（如需严格校验可检查关键 env 或跑一次轻量 SQL）
     return {"status": "ok"}
 
-
-# ------------------------------------------------------------
-# 启动：连接数据库、自动建表、可选开启调度器
-# ------------------------------------------------------------
 @app.on_event("startup")
 def _startup():
-    init_db()       # 初始化 Engine/Session 工厂
-    init_tables()   # 自动建表（幂等）
+    init_db()
+    init_tables()
     if os.getenv("START_SCHEDULER", "true").lower() == "true":
         start_scheduler()
 
-
-# ------------------------------------------------------------
-# 简单鉴权（仅本文件内接口用；/dpc 与 /admin 内部自带鉴权）
-# ------------------------------------------------------------
+# === 强制鉴权 ===
 def _check_auth(token: str | None):
     if not API_TOKEN:
-        return
-    if not token or token != API_TOKEN:
+        raise HTTPException(status_code=500, detail="server misconfigured: API_SHARED_TOKEN missing")
+    if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
 
-
-# ------------------------------------------------------------
-# 你的原有数据模型
-# ------------------------------------------------------------
+# === 数据模型 ===
 class MatchInput(BaseModel):
     match_id: str
     home: str
     away: str
-    # 可扩展：赔率、伤停、Elo 等
     features: dict = Field(default_factory=dict)
 
 class BacktestInput(BaseModel):
@@ -144,51 +114,29 @@ class BacktestInput(BaseModel):
 class ChatInput(BaseModel):
     messages: list[dict]
 
-
-# ------------------------------------------------------------
-# 工具函数
-# ------------------------------------------------------------
+# === 工具函数 ===
 async def _call_http(endpoint: str, payload: dict):
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(endpoint, json=payload)
         r.raise_for_status()
         return r.json()
 
-from sqlalchemy import text, bindparam
-from sqlalchemy.dialects.postgresql import JSONB
-
-def _save_prediction(match_id: str, model: str, payload: dict, result: dict) -> None:
-    """
-    稳定地把预测写入 predictions 表：
-    - 使用 PostgreSQL JSONB 类型绑定，避免 JSON 序列化/适配器问题
-    - 任何异常都会被捕获并记录，不会让 /predict 接口 500
-    """
+def _save_prediction(match_id: str, model: str, payload: dict, result: dict):
     db = SessionLocal()
     try:
-        stmt = (
-            text("""
-                INSERT INTO predictions (match_id, model, payload_json, result_json)
-                VALUES (:m, :model, :p, :r)
-            """)
-            .bindparams(
-                bindparam("p", type_=JSONB),
-                bindparam("r", type_=JSONB),
-            )
-        )
-
         db.execute(
-            stmt,
+            text(
+                "INSERT INTO predictions (match_id, model, payload_json, result_json) "
+                "VALUES (:m,:model,:p,:r)"
+            ),
             {
                 "m": match_id,
                 "model": model,
-                "p": payload,
-                "r": result,
+                "p": json.dumps(payload, ensure_ascii=False),
+                "r": json.dumps(result, ensure_ascii=False),
             },
         )
         db.commit()
-    except Exception as e:
-        print(f"[warn] save_prediction failed: {e}")
-        db.rollback()
     finally:
         db.close()
 
@@ -198,10 +146,7 @@ def _select_model(model: str):
         raise HTTPException(status_code=400, detail="model must be v5|triad|ensemble")
     return m
 
-
-# ------------------------------------------------------------
-# 你的原有接口
-# ------------------------------------------------------------
+# === 接口 ===
 @app.post("/predict")
 async def predict(payload: MatchInput, model: str = "v5", x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
@@ -225,22 +170,14 @@ async def predict(payload: MatchInput, model: str = "v5", x_api_token: str | Non
         else:
             res = v5.combine_with_triad(v5.predict(data), triad.predict(data))
 
-    # 可选写库；失败不影响响应
-    if SAVE_PREDICTIONS:
-        try:
-            _save_prediction(payload.match_id, sel, data, res)
-        except Exception:
-            logger.exception("SAVE_PREDICTIONS=True but save failed")
-
+    _save_prediction(payload.match_id, sel, data, res)
     return {"match_id": payload.match_id, "home": payload.home, "away": payload.away, **res}
-
 
 @app.post("/scores/top3")
 async def top3_scores(payload: MatchInput, model: str = "v5", x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
     sel  = _select_model(model)
     data = payload.model_dump()
-
     if CALL_MODE == "http":
         if sel == "ensemble":
             r1 = await _call_http(ENDPOINT_V5, data)
@@ -249,7 +186,6 @@ async def top3_scores(payload: MatchInput, model: str = "v5", x_api_token: str |
         else:
             endpoint = ENDPOINT_V5 if sel == "v5" else ENDPOINT_TRIAD
             r = await _call_http(endpoint, data)
-            # 若远端不返回比分分布，这里兜底推导
             res = v5.derive_top3_from_result(r)
     else:
         if sel == "v5":
@@ -262,11 +198,9 @@ async def top3_scores(payload: MatchInput, model: str = "v5", x_api_token: str |
             )
     return {"match_id": payload.match_id, "home": payload.home, "away": payload.away, **res}
 
-
 @app.post("/backtest")
 def backtest(payload: BacktestInput, x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
-    # 简化示例回测：胜平负准确率
     total, hit = 0, 0
     for m in payload.matches:
         total += 1
@@ -281,7 +215,6 @@ def backtest(payload: BacktestInput, x_api_token: str | None = Header(default=No
     acc = hit / total if total else 0.0
     return {"total": total, "hit": hit, "acc": round(acc, 4)}
 
-
 @app.post("/assistant")
 async def assistant(payload: dict, x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
@@ -294,9 +227,29 @@ async def assistant(payload: dict, x_api_token: str | None = Header(default=None
         r.raise_for_status()
         return r.json()
 
-
-# ------------------------------------------------------------
-# 挂载子路由：/dpc/* 与 /admin/*
-# ------------------------------------------------------------
+# === 挂载子路由 ===
 app.include_router(dpc_router)
 app.include_router(admin_router)
+
+# === 自定义 Swagger：加全局 X-API-Token Header ===
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        routes=app.routes,
+    )
+    for path in openapi_schema.get("paths", {}).values():
+        for op in path.values():
+            params = op.setdefault("parameters", [])
+            params.append({
+                "name": "X-API-Token",
+                "in": "header",
+                "required": True,
+                "schema": {"type": "string"},
+            })
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
