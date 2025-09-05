@@ -34,12 +34,12 @@ class IngestItem(BaseModel):
             raise ValueError("confidence must be in [0,1]")
         return v
 
-    @field_validator("entity_id", "schema_name", "schema_version", "entity_type")
-    @classmethod
-    def _no_blank(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("must not be empty")
-        return v.strip()
+    @field_validator("schema_name", "schema_version", "entity_type")
+@classmethod
+def _no_blank(cls, v: str) -> str:
+    if not v or not v.strip():
+        raise ValueError("must not be empty")
+    return v.strip()
 
 class IngestBatch(BaseModel):
     items: List[IngestItem] = Field(..., description="批量项目，最多 500 条")
