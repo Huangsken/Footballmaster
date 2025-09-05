@@ -11,10 +11,16 @@ ENDPOINT_V5 = os.getenv("MODEL_ENDPOINT_V5", "").strip()
 ENDPOINT_TRIAD = os.getenv("MODEL_ENDPOINT_TRIAD", "").strip()
 
 from models import v5, triad
+from .cron import start_scheduler
 
 app = FastAPI()
 init_db()
 
+@app.on_event("startup")
+def _startup():
+    import os
+    if os.getenv("START_SCHEDULER", "true").lower() == "true":
+        start_scheduler()
 def _check_auth(token: str | None):
     if not API_TOKEN:
         return
