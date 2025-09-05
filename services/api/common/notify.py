@@ -9,7 +9,7 @@ def _clean(s: Optional[str]) -> str:
 def _tg_creds_ok() -> bool:
     return bool(_clean(settings.TELEGRAM_BOT_TOKEN)) and bool(_clean(settings.TELEGRAM_CHAT_ID))
 
-def tg_send(text: str, parse_mode: str = "HTML") -> Tuple[bool, str]:
+def tg_send(text: str, parse_mode: str = None) -> Tuple[bool, str]:
     """
     发送 Telegram 消息，返回 (ok, detail)。
     若凭证缺失/网络异常/400-403 等，给出可读 detail，便于你在响应里看到原因。
