@@ -1,7 +1,7 @@
+# services/api/api/admin.py
 from __future__ import annotations
 
-import os
-import json
+import os, json
 from typing import Optional, List
 
 from fastapi import APIRouter, Header, HTTPException
@@ -60,7 +60,7 @@ class RunFinishInput(BaseModel):
     note: Optional[str] = None
 
 # ----------------------
-# Admin utilities
+# Telegram test
 # ----------------------
 @router.post("/test-tg", summary="Test Telegram Bot")
 def test_tg(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
@@ -68,6 +68,9 @@ def test_tg(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token
     ok, detail = tg_send("✅ test message from /admin/test-tg")
     return {"ok": bool(ok), "detail": detail if not ok else "test message sent"}
 
+# ----------------------
+# DB check
+# ----------------------
 @router.post("/db-check", summary="Check DB connectivity")
 def db_check(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
     _auth_or_401(x_api_token)
@@ -79,7 +82,7 @@ def db_check(x_api_token: Optional[str] = Header(default=None, alias="X-API-Toke
         db.close()
 
 # ----------------------
-# Schema DDL (idempotent)
+# Schema (idempotent)
 # ----------------------
 DDL_STATEMENTS: list[str] = [
     # dpc_ingest_audit
@@ -157,10 +160,14 @@ DDL_STATEMENTS: list[str] = [
         finished_at TIMESTAMP
     );
     """,
-    # 关键：为 ON CONFLICT(run_id) 提供唯一约束/索引
-    "CREATE UNIQUE INDEX IF NOT EXISTS ux_feature_runs_run_id ON feature_runs(run_id);",
+    # ⚠ 关键：必须是“唯一”，才能让 ON CONFLICT(run_id) 生效
+    "DO $$ BEGIN "
+    "    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ux_feature_runs_run_id') THEN "
+    "        CREATE UNIQUE INDEX ux_feature_runs_run_id ON feature_runs(run_id); "
+    "    END IF; "
+    "END $$;",
 
-    # experiments
+    # experiments（保留）
     """
     CREATE TABLE IF NOT EXISTS experiments (
         id BIGSERIAL PRIMARY KEY,
@@ -183,7 +190,7 @@ def init_db_stub(x_api_token: Optional[str] = Header(default=None, alias="X-API-
     return {"ok": True, "msg": "schema initialized"}
 
 # ----------------------
-# Feature logging (single)
+# feature-log (one)
 # ----------------------
 @router.post("/feature-log", summary="Log one tool feature")
 def feature_log(
@@ -224,7 +231,7 @@ def feature_log(
         db.close()
 
 # ----------------------
-# Feature logging (bulk)
+# feature-bulk-log
 # ----------------------
 @router.post("/feature-bulk-log", summary="Bulk log tool features")
 def feature_bulk_log(
@@ -283,7 +290,7 @@ def feature_bulk_log(
         db.close()
 
 # ----------------------
-# Feature query
+# feature-get
 # ----------------------
 @router.get("/feature-get", summary="Get tool features")
 def feature_get(
@@ -328,17 +335,13 @@ def feature_get(
         db.close()
 
 # ----------------------
-# Runs: start / finish / get
+# run-start / run-finish / run-get
 # ----------------------
 @router.post("/run-start", summary="Start a feature run")
 def run_start(
     body: RunStartInput,
     x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
 ):
-    """
-    幂等：首次插入；重复调用则把状态/工具/备注刷新为 running。
-    依赖 ux_feature_runs_run_id 唯一索引。
-    """
     _auth_or_401(x_api_token)
     db = SessionLocal()
     try:
