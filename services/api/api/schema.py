@@ -1,16 +1,12 @@
 # services/api/api/schema.py
 from __future__ import annotations
 
-try:
-    # 标准路径
-    from common.db import engine as db_engine
-except Exception:  # fallback（与你仓库里的 dpc 保持一致）
-    from db.connection import engine as db_engine  # type: ignore
+from sqlalchemy import text
+from common.db import SessionLocal, engine as db_engine
 
-
-# 所有表定义只维护这一份
+# 统一的建表 SQL（幂等）
 DDL_STATEMENTS: list[str] = [
-    # ===== dpc_ingest_audit =====
+    # dpc_ingest_audit
     """
     CREATE TABLE IF NOT EXISTS dpc_ingest_audit (
         id BIGSERIAL PRIMARY KEY,
@@ -28,7 +24,7 @@ DDL_STATEMENTS: list[str] = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_dpc_ingest_entity ON dpc_ingest_audit(entity_type, entity_id);",
 
-    # ===== predictions =====
+    # predictions（模型预测结果）
     """
     CREATE TABLE IF NOT EXISTS predictions (
         id BIGSERIAL PRIMARY KEY,
@@ -41,7 +37,7 @@ DDL_STATEMENTS: list[str] = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_predictions_match_model ON predictions(match_id, model);",
 
-    # ===== users =====
+    # users（预留）
     """
     CREATE TABLE IF NOT EXISTS users (
         id BIGSERIAL PRIMARY KEY,
@@ -51,7 +47,7 @@ DDL_STATEMENTS: list[str] = [
     );
     """,
 
-    # ===== tool_features（工具特征写死存证） =====
+    # tool_features（工具特征库）
     """
     CREATE TABLE IF NOT EXISTS tool_features (
         id BIGSERIAL PRIMARY KEY,
@@ -70,7 +66,7 @@ DDL_STATEMENTS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_tool_features_tool   ON tool_features(tool);",
     "CREATE INDEX IF NOT EXISTS idx_tool_features_key    ON tool_features(feature_key);",
 
-    # ===== feature_runs（工具任务运行记录） =====
+    # feature_runs（批次运行记录）
     """
     CREATE TABLE IF NOT EXISTS feature_runs (
         id BIGSERIAL PRIMARY KEY,
@@ -85,9 +81,9 @@ DDL_STATEMENTS: list[str] = [
         finished_at TIMESTAMP
     );
     """,
-    "CREATE INDEX IF NOT EXISTS idx_feature_runs_run ON feature_runs(run_id);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_feature_runs_run_id ON feature_runs(run_id);",
 
-    # ===== experiments（实验与特征开关） =====
+    # experiments（保留）
     """
     CREATE TABLE IF NOT EXISTS experiments (
         id BIGSERIAL PRIMARY KEY,
@@ -98,12 +94,33 @@ DDL_STATEMENTS: list[str] = [
         note TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    """,
+
+    # ✅ matches（backfill 落库目标表）
     """
+    CREATE TABLE IF NOT EXISTS matches (
+        id BIGSERIAL PRIMARY KEY,
+        match_id TEXT NOT NULL,
+        season   TEXT NOT NULL,
+        league   TEXT NOT NULL,
+        home     TEXT NOT NULL,
+        away     TEXT NOT NULL,
+        date     TIMESTAMP,
+        raw_json JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_matches_match_id ON matches(match_id);",
+    "CREATE INDEX IF NOT EXISTS idx_matches_season_league ON matches(season, league);",
+    "CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(date);",
 ]
 
 
-def init_tables() -> None:
-    """幂等建表：启动或手动触发都可执行，多次执行安全。"""
+def init_tables() -> dict:
+    """
+    幂等建表：应用启动时调用。
+    """
     with db_engine.begin() as conn:
         for sql in DDL_STATEMENTS:
             conn.exec_driver_sql(sql)
+    return {"ok": True, "msg": "schema initialized"}
