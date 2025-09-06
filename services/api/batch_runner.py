@@ -3,7 +3,7 @@ import uuid
 import datetime
 
 API_BASE = "https://footballmaster.onrender.com/admin"
-API_TOKEN = "请替换成你的X-API-Token"
+API_TOKEN = f96bf21ddce541b4a89febdde3fdc634
 
 HEADERS = {
     "accept": "application/json",
