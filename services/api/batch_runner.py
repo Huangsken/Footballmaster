@@ -1,74 +1,83 @@
-import requests
-import uuid
-import datetime
+from __future__ import annotations
+import os, sys, time, argparse, json
+import httpx
+from sqlalchemy import text
+from common.db import SessionLocal
 
-API_BASE = "https://footballmaster.onrender.com/admin"
-API_TOKEN = f96bf21ddce541b4a89febdde3fdc634
+API_KEY = os.getenv(310190775014390ec8832b6e80148e88, "").strip()
+API_HOST = "https://v3.football.api-sports.io"
 
-HEADERS = {
-    "accept": "application/json",
-    "Content-Type": "application/json",
-    "X-API-Token": API_TOKEN,
-}
+# ============ API 调用 ============
 
-def new_run_id():
-    today = datetime.datetime.now().strftime("%Y%m%d")
-    return f"EPL-{today}-BATCH-{uuid.uuid4().hex[:6].upper()}"
+def fetch_matches(league: str, season: int):
+    """抓取某赛季所有比赛"""
+    headers = {"x-apisports-key": API_KEY}
+    url = f"{API_HOST}/fixtures"
+    params = {"league": 39 if league.upper()=="EPL" else league, "season": season}
+    with httpx.Client(timeout=60) as client:
+        r = client.get(url, headers=headers, params=params)
+        r.raise_for_status()
+        return r.json()
 
-def run_batch(matches):
-    run_id = new_run_id()
-    print(f"开始批次: {run_id}")
+# ============ 数据落库 ============
 
-    # Step 1: run-start
-    resp = requests.post(
-        f"{API_BASE}/run-start",
-        headers=HEADERS,
-        json={"run_id": run_id, "tool": "nine_tools", "note": "batch import test"},
-    )
-    print("run-start:", resp.json())
+def save_match(raw: dict, run_id: str):
+    db = SessionLocal()
+    try:
+        db.execute(
+            text("""
+                INSERT INTO dpc_ingest_audit
+                (run_id, source_id, entity_type, entity_id, action, confidence, signature, status, message)
+                VALUES (:run_id, :source_id, :etype, :eid, :action, :conf, :sig, :status, :msg)
+            """),
+            {
+                "run_id": run_id,
+                "source_id": str(raw.get("fixture", {}).get("id")),
+                "entity_type": "match",
+                "entity_id": str(raw.get("fixture", {}).get("id")),
+                "action": "ingest",
+                "conf": 1.0,
+                "sig": None,
+                "status": "ok",
+                "msg": json.dumps(raw, ensure_ascii=False),
+            },
+        )
+        db.commit()
+    finally:
+        db.close()
 
-    # Step 2: feature-bulk-log
-    resp = requests.post(
-        f"{API_BASE}/feature-bulk-log",
-        headers=HEADERS,
-        json={"run_id": run_id, "items": matches},
-    )
-    print("feature-bulk-log:", resp.json())
+# ============ 主逻辑 ============
 
-    # Step 3: run-finish
-    resp = requests.post(
-        f"{API_BASE}/run-finish",
-        headers=HEADERS,
-        json={"run_id": run_id, "total": len(matches), "ok": len(matches), "fail": 0, "status": "finished", "note": "batch write finished"},
-    )
-    print("run-finish:", resp.json())
+def run_batch(league: str, start_season: int, end_season: int, run_id: str):
+    print(f"▶ 开始批处理: {league} {start_season}–{end_season}, run_id={run_id}")
+    for season in range(start_season, end_season+1):
+        print(f"  抓取赛季 {season}...")
+        try:
+            data = fetch_matches(league, season)
+            matches = data.get("response", [])
+            print(f"   共 {len(matches)} 场")
+            for m in matches:
+                save_match(m, run_id)
+            time.sleep(3)  # 降低 API 压力
+        except Exception as e:
+            print(f"❌ 赛季 {season} 出错: {e}")
+            time.sleep(10)
 
-    # Step 4: run-get
-    resp = requests.get(f"{API_BASE}/run-get", headers=HEADERS, params={"run_id": run_id})
-    print("run-get:", resp.json())
+    print("✅ 全部赛季处理完毕")
 
+# ============ CLI ============
 
 if __name__ == "__main__":
-    # 示例数据：两场比赛
-    matches = [
-        {
-            "entity_type": "match",
-            "entity_id": "EPL-2015-01-AAA",
-            "tool": "nine_tools",
-            "feature_key": "zodiac_degree.sun",
-            "feature_val": {"delta": 111.1, "arsenal": 200.0, "chelsea": 95.0},
-            "tool_version": "1.0.0",
-            "confidence": 0.95,
-        },
-        {
-            "entity_type": "match",
-            "entity_id": "EPL-2015-01-BBB",
-            "tool": "nine_tools",
-            "feature_key": "zodiac_degree.sun",
-            "feature_val": {"delta": 222.2, "arsenal": 188.0, "chelsea": 88.0},
-            "tool_version": "1.0.0",
-            "confidence": 0.9,
-        },
-    ]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--league", type=str, default="EPL")
+    parser.add_argument("--seasons", type=str, required=True, help="e.g. 2014-2024")
+    parser.add_argument("--run-id", type=str, required=True)
+    args = parser.parse_args()
 
-    run_batch(matches)
+    try:
+        start, end = [int(x) for x in args.seasons.split("-")]
+    except Exception:
+        print("❌ seasons 参数错误，应为形如 2014-2024")
+        sys.exit(1)
+
+    run_batch(args.league, start, end, args.run_id)
