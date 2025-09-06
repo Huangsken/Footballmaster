@@ -214,7 +214,7 @@ def feature_log(
                     entity_type, entity_id, tool, feature_key, feature_val,
                     tool_version, source, confidence, computed_at
                 ) VALUES (
-                    :entity_type, :entity_id, :tool, :feature_key, :feature_val::jsonb,
+                    :entity_type, :entity_id, :tool, :feature_key, CAST(:feature_val AS JSONB),
                     :tool_version, :source, :confidence,
                     COALESCE(:computed_at, CURRENT_TIMESTAMP)
                 )
@@ -250,7 +250,6 @@ def feature_bulk_log(
     _auth_or_401(x_api_token)
 
     if body.dry_run:
-        # 只做验证，不落库
         return {"ok": True, "dry_run": True, "count": len(body.items)}
 
     db = SessionLocal()
@@ -264,7 +263,7 @@ def feature_bulk_log(
                         entity_type, entity_id, tool, feature_key, feature_val,
                         tool_version, source, confidence, computed_at
                     ) VALUES (
-                        :entity_type, :entity_id, :tool, :feature_key, :feature_val::jsonb,
+                        :entity_type, :entity_id, :tool, :feature_key, CAST(:feature_val AS JSONB),
                         :tool_version, :source, :confidence,
                         COALESCE(:computed_at, CURRENT_TIMESTAMP)
                     )
@@ -285,7 +284,6 @@ def feature_bulk_log(
             ids.append(r.scalar())
             inserted += 1
 
-        # 如果带 run_id，则把 ok/total 累加到该 run（不改变状态）
         if body.run_id:
             db.execute(
                 text("""
@@ -334,7 +332,6 @@ def feature_get(
     db = SessionLocal()
     try:
         rows = db.execute(text(sql), params).mappings().all()
-        # feature_val 兜底转回 dict
         items = []
         for r in rows:
             fv = r["feature_val"]
