@@ -1,4 +1,3 @@
-# services/api/api/app.py
 from __future__ import annotations
 
 import os, json
@@ -18,6 +17,7 @@ from cron import start_scheduler
 # 路由
 from api.dpc import router as dpc_router
 from api.admin import router as admin_router
+from api.backfill import router as backfill_router   # ✅ 新增
 
 # 统一复用 schema 的建表逻辑
 from api.schema import init_tables
@@ -55,10 +55,9 @@ def _startup():
     if os.getenv("START_SCHEDULER", "true").lower() == "true":
         start_scheduler()
 
-# 简单鉴权（本文件内接口用；/dpc 与 /admin 内部自带鉴权）
+# 简单鉴权
 def _check_auth(token: str | None):
     if not API_TOKEN:
-        # 你希望强制要求带 token，这里没有就视为配置错误
         raise HTTPException(status_code=500, detail="server misconfigured: API_SHARED_TOKEN missing")
     if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
@@ -84,7 +83,6 @@ async def _call_http(endpoint: str, payload: dict):
         return r.json()
 
 def _save_prediction(match_id: str, model: str, payload: dict, result: dict):
-    """落库预测结果；如需完全兜底可加 try/except，但你现在已能正常入库。"""
     db = SessionLocal()
     try:
         db.execute(
@@ -194,6 +192,7 @@ async def assistant(payload: dict, x_api_token: str | None = Header(default=None
 # 挂载子路由
 app.include_router(dpc_router)
 app.include_router(admin_router)
+app.include_router(backfill_router, prefix="/admin")  # ✅ 新增
 
 # 自定义 Swagger：要求全局 X-API-Token
 def custom_openapi():
