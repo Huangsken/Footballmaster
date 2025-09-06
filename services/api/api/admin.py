@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import os, json
+import os
+import json
 from typing import Optional, List
 
 from fastapi import APIRouter, Header, HTTPException
@@ -17,7 +18,6 @@ except Exception:
 router = APIRouter(prefix="/admin", tags=["admin"])
 API_TOKEN = os.getenv("API_SHARED_TOKEN", "").strip()
 
-
 # ----------------------
 # Auth helper
 # ----------------------
@@ -26,7 +26,6 @@ def _auth_or_401(token: Optional[str]):
         return
     if not token or token.strip() != API_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
-
 
 # ----------------------
 # Pydantic models
@@ -42,18 +41,15 @@ class FeatureLogInput(BaseModel):
     confidence: Optional[float] = None
     computed_at: Optional[str] = None  # ISO string
 
-
 class FeatureBulkInput(BaseModel):
     items: List[FeatureLogInput] = Field(min_length=1, max_length=1000)
     run_id: Optional[str] = None
     dry_run: bool = False
 
-
 class RunStartInput(BaseModel):
     run_id: str
     tool: str
     note: Optional[str] = None
-
 
 class RunFinishInput(BaseModel):
     run_id: str
@@ -63,9 +59,8 @@ class RunFinishInput(BaseModel):
     status: str = "finished"
     note: Optional[str] = None
 
-
 # ----------------------
-# Telegram test
+# Admin utilities
 # ----------------------
 @router.post("/test-tg", summary="Test Telegram Bot")
 def test_tg(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
@@ -73,10 +68,6 @@ def test_tg(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token
     ok, detail = tg_send("✅ test message from /admin/test-tg")
     return {"ok": bool(ok), "detail": detail if not ok else "test message sent"}
 
-
-# ----------------------
-# DB check
-# ----------------------
 @router.post("/db-check", summary="Check DB connectivity")
 def db_check(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
     _auth_or_401(x_api_token)
@@ -87,9 +78,8 @@ def db_check(x_api_token: Optional[str] = Header(default=None, alias="X-API-Toke
     finally:
         db.close()
 
-
 # ----------------------
-# Schema (idempotent)
+# Schema DDL (idempotent)
 # ----------------------
 DDL_STATEMENTS: list[str] = [
     # dpc_ingest_audit
@@ -167,7 +157,7 @@ DDL_STATEMENTS: list[str] = [
         finished_at TIMESTAMP
     );
     """,
-    # 关键：为 run_id 建立唯一约束，支撑 ON CONFLICT
+    # 关键：为 ON CONFLICT(run_id) 提供唯一约束/索引
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_feature_runs_run_id ON feature_runs(run_id);",
 
     # experiments
@@ -184,7 +174,6 @@ DDL_STATEMENTS: list[str] = [
     """
 ]
 
-
 @router.post("/init-db", summary="Init DB schema")
 def init_db_stub(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
     _auth_or_401(x_api_token)
@@ -192,7 +181,6 @@ def init_db_stub(x_api_token: Optional[str] = Header(default=None, alias="X-API-
         for sql in DDL_STATEMENTS:
             conn.exec_driver_sql(sql)
     return {"ok": True, "msg": "schema initialized"}
-
 
 # ----------------------
 # Feature logging (single)
@@ -211,8 +199,9 @@ def feature_log(
                     entity_type, entity_id, tool, feature_key, feature_val,
                     tool_version, source, confidence, computed_at
                 ) VALUES (
-                    :entity_type, :entity_id, :tool, :feature_key, CAST(:feature_val AS JSONB),
-                    :tool_version, :source, :confidence, COALESCE(:computed_at, CURRENT_TIMESTAMP)
+                    :entity_type, :entity_id, :tool, :feature_key, :feature_val::jsonb,
+                    :tool_version, :source, :confidence,
+                    COALESCE(:computed_at, CURRENT_TIMESTAMP)
                 )
                 RETURNING id
             """),
@@ -234,7 +223,6 @@ def feature_log(
     finally:
         db.close()
 
-
 # ----------------------
 # Feature logging (bulk)
 # ----------------------
@@ -244,54 +232,55 @@ def feature_bulk_log(
     x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
 ):
     _auth_or_401(x_api_token)
-
     if body.dry_run:
         return {"ok": True, "dry_run": True, "count": len(body.items)}
 
     db = SessionLocal()
+    inserted = 0
     ids: list[int] = []
     try:
-        for it in body.items:
+        for item in body.items:
             r = db.execute(
                 text("""
                     INSERT INTO tool_features (
                         entity_type, entity_id, tool, feature_key, feature_val,
                         tool_version, source, confidence, computed_at
                     ) VALUES (
-                        :entity_type, :entity_id, :tool, :feature_key, CAST(:feature_val AS JSONB),
-                        :tool_version, :source, :confidence, COALESCE(:computed_at, CURRENT_TIMESTAMP)
+                        :entity_type, :entity_id, :tool, :feature_key, :feature_val::jsonb,
+                        :tool_version, :source, :confidence,
+                        COALESCE(:computed_at, CURRENT_TIMESTAMP)
                     )
                     RETURNING id
                 """),
                 {
-                    "entity_type": it.entity_type,
-                    "entity_id": it.entity_id,
-                    "tool": it.tool,
-                    "feature_key": it.feature_key,
-                    "feature_val": json.dumps(it.feature_val, ensure_ascii=False),
-                    "tool_version": it.tool_version,
-                    "source": it.source or "manual",
-                    "confidence": float(it.confidence or 1.0),
-                    "computed_at": it.computed_at,
+                    "entity_type": item.entity_type,
+                    "entity_id": item.entity_id,
+                    "tool": item.tool,
+                    "feature_key": item.feature_key,
+                    "feature_val": json.dumps(item.feature_val, ensure_ascii=False),
+                    "tool_version": item.tool_version,
+                    "source": item.source or "manual",
+                    "confidence": float(item.confidence or 1.0),
+                    "computed_at": item.computed_at,
                 },
             )
             ids.append(r.scalar())
+            inserted += 1
 
         if body.run_id:
             db.execute(
                 text("""
                     UPDATE feature_runs
-                    SET ok = ok + :n, total = total + :n
+                    SET ok = ok + :ok, total = total + :total
                     WHERE run_id = :run_id
                 """),
-                {"n": len(ids), "run_id": body.run_id},
+                {"ok": inserted, "total": inserted, "run_id": body.run_id},
             )
 
         db.commit()
-        return {"ok": True, "inserted": len(ids), "ids": ids, "run_id": body.run_id}
+        return {"ok": True, "inserted": inserted, "ids": ids, "run_id": body.run_id}
     finally:
         db.close()
-
 
 # ----------------------
 # Feature query
@@ -338,20 +327,22 @@ def feature_get(
     finally:
         db.close()
 
-
 # ----------------------
 # Runs: start / finish / get
 # ----------------------
-@router.post("/run-start", summary="Start a feature run (idempotent)")
+@router.post("/run-start", summary="Start a feature run")
 def run_start(
     body: RunStartInput,
     x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
 ):
+    """
+    幂等：首次插入；重复调用则把状态/工具/备注刷新为 running。
+    依赖 ux_feature_runs_run_id 唯一索引。
+    """
     _auth_or_401(x_api_token)
     db = SessionLocal()
     try:
-        # 显式带 total/ok/fail = 0；有唯一索引后可安全 upsert
-        db.execute(
+        row = db.execute(
             text("""
                 INSERT INTO feature_runs (run_id, tool, total, ok, fail, status, note)
                 VALUES (:run_id, :tool, 0, 0, 0, 'running', :note)
@@ -359,21 +350,14 @@ def run_start(
                 SET tool = EXCLUDED.tool,
                     status = 'running',
                     note = EXCLUDED.note
+                RETURNING id, run_id, status
             """),
             {"run_id": body.run_id, "tool": body.tool, "note": body.note},
-        )
+        ).mappings().first()
         db.commit()
-        row = db.execute(
-            text("""
-                SELECT id, run_id, tool, total, ok, fail, status, note, started_at, finished_at
-                FROM feature_runs WHERE run_id = :run_id
-            """),
-            {"run_id": body.run_id},
-        ).mappings().one()
-        return {"ok": True, "item": dict(row)}
+        return {"ok": True, "item": dict(row) if row else {"run_id": body.run_id, "status": "running"}}
     finally:
         db.close()
-
 
 @router.post("/run-finish", summary="Finish a feature run")
 def run_finish(
@@ -403,7 +387,6 @@ def run_finish(
         return {"ok": True, "updated": r.rowcount}
     finally:
         db.close()
-
 
 @router.get("/run-get", summary="Get feature run")
 def run_get(
