@@ -208,7 +208,7 @@ def feature_log(
     _auth_or_401(x_api_token)
     db = SessionLocal()
     try:
-        db.execute(
+        r = db.execute(
             text("""
                 INSERT INTO tool_features (
                     entity_type, entity_id, tool, feature_key, feature_val,
@@ -218,6 +218,7 @@ def feature_log(
                     :tool_version, :source, :confidence,
                     COALESCE(:computed_at, CURRENT_TIMESTAMP)
                 )
+                RETURNING id
             """),
             {
                 "entity_type": body.entity_type,
@@ -226,14 +227,14 @@ def feature_log(
                 "feature_key": body.feature_key,
                 "feature_val": json.dumps(body.feature_val, ensure_ascii=False),
                 "tool_version": body.tool_version,
-                "source": body.source,
-                "confidence": body.confidence,
+                "source": body.source or "manual",
+                "confidence": float(body.confidence or 1.0),
                 "computed_at": body.computed_at,
             },
         )
+        new_id = r.scalar()
         db.commit()
-        new_id = db.execute(text("SELECT currval(pg_get_serial_sequence('tool_features','id'))")).scalar()
-        return {"ok": True, "id": int(new_id) if new_id else None}
+        return {"ok": True, "id": int(new_id) if new_id is not None else None}
     finally:
         db.close()
 
@@ -254,9 +255,10 @@ def feature_bulk_log(
 
     db = SessionLocal()
     inserted = 0
+    ids: list[int] = []
     try:
         for item in body.items:
-            db.execute(
+            r = db.execute(
                 text("""
                     INSERT INTO tool_features (
                         entity_type, entity_id, tool, feature_key, feature_val,
@@ -266,6 +268,7 @@ def feature_bulk_log(
                         :tool_version, :source, :confidence,
                         COALESCE(:computed_at, CURRENT_TIMESTAMP)
                     )
+                    RETURNING id
                 """),
                 {
                     "entity_type": item.entity_type,
@@ -274,14 +277,15 @@ def feature_bulk_log(
                     "feature_key": item.feature_key,
                     "feature_val": json.dumps(item.feature_val, ensure_ascii=False),
                     "tool_version": item.tool_version,
-                    "source": item.source,
-                    "confidence": item.confidence,
+                    "source": item.source or "manual",
+                    "confidence": float(item.confidence or 1.0),
                     "computed_at": item.computed_at,
                 },
             )
+            ids.append(r.scalar())
             inserted += 1
 
-        # 如果带 run_id，则把 ok 累加到该 run（不改变状态）
+        # 如果带 run_id，则把 ok/total 累加到该 run（不改变状态）
         if body.run_id:
             db.execute(
                 text("""
@@ -293,7 +297,7 @@ def feature_bulk_log(
             )
 
         db.commit()
-        return {"ok": True, "inserted": inserted}
+        return {"ok": True, "inserted": inserted, "ids": ids, "run_id": body.run_id}
     finally:
         db.close()
 
@@ -312,26 +316,35 @@ def feature_get(
     x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
 ):
     _auth_or_401(x_api_token)
-    sql = """
+    where = ["entity_type = :entity_type", "entity_id = :entity_id"]
+    params = {"entity_type": entity_type, "entity_id": entity_id, "limit": limit, "offset": offset}
+    if tool:
+        where.append("tool = :tool"); params["tool"] = tool
+    if feature_key:
+        where.append("feature_key = :feature_key"); params["feature_key"] = feature_key
+
+    sql = f"""
         SELECT id, entity_type, entity_id, tool, feature_key, feature_val,
                tool_version, source, confidence, computed_at
         FROM tool_features
-        WHERE entity_type = :entity_type AND entity_id = :entity_id
+        WHERE {" AND ".join(where)}
+        ORDER BY id DESC
+        LIMIT :limit OFFSET :offset
     """
-    params = {"entity_type": entity_type, "entity_id": entity_id}
-    if tool:
-        sql += " AND tool = :tool"
-        params["tool"] = tool
-    if feature_key:
-        sql += " AND feature_key = :feature_key"
-        params["feature_key"] = feature_key
-    sql += " ORDER BY id DESC LIMIT :limit OFFSET :offset"
-    params.update({"limit": limit, "offset": offset})
-
     db = SessionLocal()
     try:
         rows = db.execute(text(sql), params).mappings().all()
-        return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
+        # feature_val 兜底转回 dict
+        items = []
+        for r in rows:
+            fv = r["feature_val"]
+            if isinstance(fv, str):
+                try:
+                    fv = json.loads(fv)
+                except Exception:
+                    pass
+            items.append({**dict(r), "feature_val": fv})
+        return {"ok": True, "count": len(items), "items": items}
     finally:
         db.close()
 
@@ -369,7 +382,7 @@ def run_finish(
     _auth_or_401(x_api_token)
     db = SessionLocal()
     try:
-        db.execute(
+        r = db.execute(
             text("""
                 UPDATE feature_runs
                 SET total = :total, ok = :ok, fail = :fail,
@@ -386,7 +399,7 @@ def run_finish(
             },
         )
         db.commit()
-        return {"ok": True, "updated": 1}
+        return {"ok": True, "updated": r.rowcount}
     finally:
         db.close()
 
@@ -413,178 +426,5 @@ def run_get(
             {"run_id": run_id, "limit": limit, "offset": offset},
         ).mappings().all()
         return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
-    finally:
-        db.close()
-
-# =========================
-# Feature logging endpoints
-# =========================
-from sqlalchemy import text
-import json
-
-@router.post("/feature-log", summary="Log one feature row")
-def feature_log(
-    item: FeatureLogInput,
-    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
-):
-    _auth_or_401(x_api_token)
-    db = SessionLocal()
-    try:
-        r = db.execute(
-            text(
-                """
-                INSERT INTO tool_features
-                (entity_type, entity_id, tool, feature_key, feature_val, tool_version, source, confidence, computed_at)
-                VALUES
-                (:entity_type, :entity_id, :tool, :feature_key, CAST(:feature_val AS JSONB),
-                 :tool_version, :source, :confidence, COALESCE(:computed_at, CURRENT_TIMESTAMP))
-                RETURNING id
-                """
-            ),
-            {
-                "entity_type": item.entity_type,
-                "entity_id": item.entity_id,
-                "tool": item.tool,
-                "feature_key": item.feature_key,
-                "feature_val": json.dumps(item.feature_val, ensure_ascii=False),
-                "tool_version": item.tool_version,
-                "source": item.source or "manual",
-                "confidence": float(item.confidence or 1.0),
-                "computed_at": item.computed_at,
-            },
-        )
-        new_id = r.scalar()
-        db.commit()
-        return {"ok": True, "id": new_id}
-    finally:
-        db.close()
-
-
-@router.post("/feature-bulk-log", summary="Bulk log feature rows")
-def feature_bulk_log(
-    payload: FeatureBulkInput,
-    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
-):
-    """
-    批量写入特征；若 dry_run=True 则只做校验不写库。
-    run_id 字段仅作为回显，不在此处自动写 feature_runs（你已单独有 run-start/run-finish）。
-    """
-    _auth_or_401(x_api_token)
-
-    total = len(payload.items or [])
-    ok, fail = 0, 0
-    inserted_ids: list[int] = []
-
-    if payload.dry_run:
-        # 仅校验 schema，不落库
-        return {"ok": True, "dry_run": True, "total": total, "ok": total, "fail": 0, "ids": []}
-
-    db = SessionLocal()
-    try:
-        for it in payload.items:
-            try:
-                r = db.execute(
-                    text(
-                        """
-                        INSERT INTO tool_features
-                        (entity_type, entity_id, tool, feature_key, feature_val, tool_version, source, confidence, computed_at)
-                        VALUES
-                        (:entity_type, :entity_id, :tool, :feature_key, CAST(:feature_val AS JSONB),
-                         :tool_version, :source, :confidence, COALESCE(:computed_at, CURRENT_TIMESTAMP))
-                        RETURNING id
-                        """
-                    ),
-                    {
-                        "entity_type": it.entity_type,
-                        "entity_id": it.entity_id,
-                        "tool": it.tool,
-                        "feature_key": it.feature_key,
-                        "feature_val": json.dumps(it.feature_val, ensure_ascii=False),
-                        "tool_version": it.tool_version,
-                        "source": it.source or "manual",
-                        "confidence": float(it.confidence or 1.0),
-                        "computed_at": it.computed_at,
-                    },
-                )
-                inserted_ids.append(r.scalar())
-                ok += 1
-            except Exception:
-                db.rollback()
-                fail += 1
-            else:
-                # 为减少事务开销，按批次统一提交；也可这里小步提交
-                pass
-
-        db.commit()
-        return {
-            "ok": True,
-            "run_id": payload.run_id,
-            "total": total,
-            "inserted": ok,
-            "failed": fail,
-            "ids": inserted_ids,
-        }
-    finally:
-        db.close()
-
-
-@router.get("/feature-get", summary="Query feature rows")
-def feature_get(
-    entity_type: str,
-    entity_id: str,
-    tool: Optional[str] = None,
-    feature_key: Optional[str] = None,
-    limit: int = 100,
-    offset: int = 0,
-    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
-):
-    _auth_or_401(x_api_token)
-
-    where = ["entity_type = :entity_type", "entity_id = :entity_id"]
-    params = {"entity_type": entity_type, "entity_id": entity_id, "limit": limit, "offset": offset}
-
-    if tool:
-        where.append("tool = :tool")
-        params["tool"] = tool
-    if feature_key:
-        where.append("feature_key = :feature_key")
-        params["feature_key"] = feature_key
-
-    sql = f"""
-        SELECT id, entity_type, entity_id, tool, feature_key, feature_val, tool_version,
-               source, confidence, computed_at
-        FROM tool_features
-        WHERE {" AND ".join(where)}
-        ORDER BY id DESC
-        LIMIT :limit OFFSET :offset
-    """
-
-    db = SessionLocal()
-    try:
-        rows = db.execute(text(sql), params).mappings().all()
-        # 把 feature_val 直接返回为 JSON（已经是 JSONB，mappings() 会给成 dict/str，保险起见再处理一下）
-        items = []
-        for r in rows:
-            fv = r["feature_val"]
-            if isinstance(fv, str):
-                try:
-                    fv = json.loads(fv)
-                except Exception:
-                    pass
-            items.append(
-                {
-                    "id": r["id"],
-                    "entity_type": r["entity_type"],
-                    "entity_id": r["entity_id"],
-                    "tool": r["tool"],
-                    "feature_key": r["feature_key"],
-                    "feature_val": fv,
-                    "tool_version": r["tool_version"],
-                    "source": r["source"],
-                    "confidence": r["confidence"],
-                    "computed_at": r["computed_at"],
-                }
-            )
-        return {"ok": True, "count": len(items), "items": items}
     finally:
         db.close()
