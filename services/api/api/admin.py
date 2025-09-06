@@ -14,7 +14,6 @@ try:
 except Exception:
     from db.connection import engine as db_engine  # fallback
 
-
 router = APIRouter(prefix="/admin", tags=["admin"])
 API_TOKEN = os.getenv("API_SHARED_TOKEN", "").strip()
 
@@ -30,10 +29,9 @@ def _auth_or_401(token: Optional[str]):
 
 
 # ----------------------
-# Pydantic models（特征写入 & 运行记录）
+# Pydantic models
 # ----------------------
 class FeatureLogInput(BaseModel):
-    """单条工具特征写入"""
     entity_type: str
     entity_id: str
     tool: str
@@ -42,11 +40,10 @@ class FeatureLogInput(BaseModel):
     tool_version: str
     source: Optional[str] = None
     confidence: Optional[float] = None
-    computed_at: Optional[str] = None  # ISO 时间字符串（可选）
+    computed_at: Optional[str] = None  # ISO string
 
 
 class FeatureBulkInput(BaseModel):
-    """批量工具特征写入"""
     items: List[FeatureLogInput] = Field(min_length=1, max_length=1000)
     run_id: Optional[str] = None
     dry_run: bool = False
@@ -68,7 +65,7 @@ class RunFinishInput(BaseModel):
 
 
 # ----------------------
-# Telegram 测试
+# Telegram test
 # ----------------------
 @router.post("/test-tg", summary="Test Telegram Bot")
 def test_tg(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
@@ -78,7 +75,7 @@ def test_tg(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token
 
 
 # ----------------------
-# DB 连接性检查
+# DB check
 # ----------------------
 @router.post("/db-check", summary="Check DB connectivity")
 def db_check(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
@@ -92,7 +89,7 @@ def db_check(x_api_token: Optional[str] = Header(default=None, alias="X-API-Toke
 
 
 # ----------------------
-# 初始化 schema（可幂等）
+# Schema (idempotent)
 # ----------------------
 DDL_STATEMENTS: list[str] = [
     # dpc_ingest_audit
@@ -170,10 +167,10 @@ DDL_STATEMENTS: list[str] = [
         finished_at TIMESTAMP
     );
     """,
-    # ✅ 关键：为 run_id 创建唯一索引，支撑 ON CONFLICT (run_id)
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_feature_runs_run_id ON feature_runs(run_id);",
+    # 关键：为 run_id 建立唯一约束，支撑 ON CONFLICT
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_feature_runs_run_id ON feature_runs(run_id);",
 
-    # experiments（保留）
+    # experiments
     """
     CREATE TABLE IF NOT EXISTS experiments (
         id BIGSERIAL PRIMARY KEY,
@@ -198,7 +195,7 @@ def init_db_stub(x_api_token: Optional[str] = Header(default=None, alias="X-API-
 
 
 # ----------------------
-# 单条特征写入
+# Feature logging (single)
 # ----------------------
 @router.post("/feature-log", summary="Log one tool feature")
 def feature_log(
@@ -214,9 +211,8 @@ def feature_log(
                     entity_type, entity_id, tool, feature_key, feature_val,
                     tool_version, source, confidence, computed_at
                 ) VALUES (
-                    :entity_type, :entity_id, :tool, :feature_key, :feature_val::jsonb,
-                    :tool_version, :source, :confidence,
-                    COALESCE(:computed_at, CURRENT_TIMESTAMP)
+                    :entity_type, :entity_id, :tool, :feature_key, CAST(:feature_val AS JSONB),
+                    :tool_version, :source, :confidence, COALESCE(:computed_at, CURRENT_TIMESTAMP)
                 )
                 RETURNING id
             """),
@@ -240,7 +236,7 @@ def feature_log(
 
 
 # ----------------------
-# 批量特征写入
+# Feature logging (bulk)
 # ----------------------
 @router.post("/feature-bulk-log", summary="Bulk log tool features")
 def feature_bulk_log(
@@ -253,55 +249,52 @@ def feature_bulk_log(
         return {"ok": True, "dry_run": True, "count": len(body.items)}
 
     db = SessionLocal()
-    inserted = 0
     ids: list[int] = []
     try:
-        for item in body.items:
+        for it in body.items:
             r = db.execute(
                 text("""
                     INSERT INTO tool_features (
                         entity_type, entity_id, tool, feature_key, feature_val,
                         tool_version, source, confidence, computed_at
                     ) VALUES (
-                        :entity_type, :entity_id, :tool, :feature_key, :feature_val::jsonb,
-                        :tool_version, :source, :confidence,
-                        COALESCE(:computed_at, CURRENT_TIMESTAMP)
+                        :entity_type, :entity_id, :tool, :feature_key, CAST(:feature_val AS JSONB),
+                        :tool_version, :source, :confidence, COALESCE(:computed_at, CURRENT_TIMESTAMP)
                     )
                     RETURNING id
                 """),
                 {
-                    "entity_type": item.entity_type,
-                    "entity_id": item.entity_id,
-                    "tool": item.tool,
-                    "feature_key": item.feature_key,
-                    "feature_val": json.dumps(item.feature_val, ensure_ascii=False),
-                    "tool_version": item.tool_version,
-                    "source": item.source or "manual",
-                    "confidence": float(item.confidence or 1.0),
-                    "computed_at": item.computed_at,
+                    "entity_type": it.entity_type,
+                    "entity_id": it.entity_id,
+                    "tool": it.tool,
+                    "feature_key": it.feature_key,
+                    "feature_val": json.dumps(it.feature_val, ensure_ascii=False),
+                    "tool_version": it.tool_version,
+                    "source": it.source or "manual",
+                    "confidence": float(it.confidence or 1.0),
+                    "computed_at": it.computed_at,
                 },
             )
             ids.append(r.scalar())
-            inserted += 1
 
         if body.run_id:
             db.execute(
                 text("""
                     UPDATE feature_runs
-                    SET ok = ok + :ok, total = total + :total
+                    SET ok = ok + :n, total = total + :n
                     WHERE run_id = :run_id
                 """),
-                {"ok": inserted, "total": inserted, "run_id": body.run_id},
+                {"n": len(ids), "run_id": body.run_id},
             )
 
         db.commit()
-        return {"ok": True, "inserted": inserted, "ids": ids, "run_id": body.run_id}
+        return {"ok": True, "inserted": len(ids), "ids": ids, "run_id": body.run_id}
     finally:
         db.close()
 
 
 # ----------------------
-# 查询特征
+# Feature query
 # ----------------------
 @router.get("/feature-get", summary="Get tool features")
 def feature_get(
@@ -347,9 +340,9 @@ def feature_get(
 
 
 # ----------------------
-# 运行记录：开始 / 结束 / 查询
+# Runs: start / finish / get
 # ----------------------
-@router.post("/run-start", summary="Start a feature run")
+@router.post("/run-start", summary="Start a feature run (idempotent)")
 def run_start(
     body: RunStartInput,
     x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
@@ -357,16 +350,27 @@ def run_start(
     _auth_or_401(x_api_token)
     db = SessionLocal()
     try:
+        # 显式带 total/ok/fail = 0；有唯一索引后可安全 upsert
         db.execute(
             text("""
                 INSERT INTO feature_runs (run_id, tool, total, ok, fail, status, note)
                 VALUES (:run_id, :tool, 0, 0, 0, 'running', :note)
-                ON CONFLICT (run_id) DO NOTHING
+                ON CONFLICT (run_id) DO UPDATE
+                SET tool = EXCLUDED.tool,
+                    status = 'running',
+                    note = EXCLUDED.note
             """),
             {"run_id": body.run_id, "tool": body.tool, "note": body.note},
         )
         db.commit()
-        return {"ok": True, "run_id": body.run_id}
+        row = db.execute(
+            text("""
+                SELECT id, run_id, tool, total, ok, fail, status, note, started_at, finished_at
+                FROM feature_runs WHERE run_id = :run_id
+            """),
+            {"run_id": body.run_id},
+        ).mappings().one()
+        return {"ok": True, "item": dict(row)}
     finally:
         db.close()
 
