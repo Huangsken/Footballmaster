@@ -15,8 +15,10 @@ try:
 except Exception:
     from db.connection import engine as db_engine  # fallback
 
+
 router = APIRouter(prefix="/admin", tags=["admin"])
 API_TOKEN = os.getenv("API_SHARED_TOKEN", "").strip()
+
 
 # ----------------------
 # Auth helper
@@ -27,8 +29,9 @@ def _auth_or_401(token: Optional[str]):
     if not token or token.strip() != API_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
 
+
 # ----------------------
-# Pydantic models
+# Pydantic models（特征写入 & 运行记录）
 # ----------------------
 class FeatureLogInput(BaseModel):
     entity_type: str
@@ -41,15 +44,18 @@ class FeatureLogInput(BaseModel):
     confidence: Optional[float] = None
     computed_at: Optional[str] = None  # ISO string
 
+
 class FeatureBulkInput(BaseModel):
     items: List[FeatureLogInput] = Field(min_length=1, max_length=1000)
     run_id: Optional[str] = None
     dry_run: bool = False
 
+
 class RunStartInput(BaseModel):
     run_id: str
     tool: str
     note: Optional[str] = None
+
 
 class RunFinishInput(BaseModel):
     run_id: str
@@ -59,8 +65,9 @@ class RunFinishInput(BaseModel):
     status: str = "finished"
     note: Optional[str] = None
 
+
 # ----------------------
-# Telegram test
+# Telegram 测试
 # ----------------------
 @router.post("/test-tg", summary="Test Telegram Bot")
 def test_tg(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
@@ -68,8 +75,9 @@ def test_tg(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token
     ok, detail = tg_send("✅ test message from /admin/test-tg")
     return {"ok": bool(ok), "detail": detail if not ok else "test message sent"}
 
+
 # ----------------------
-# DB check
+# DB 连接性检查
 # ----------------------
 @router.post("/db-check", summary="Check DB connectivity")
 def db_check(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
@@ -81,8 +89,9 @@ def db_check(x_api_token: Optional[str] = Header(default=None, alias="X-API-Toke
     finally:
         db.close()
 
+
 # ----------------------
-# Schema (idempotent)
+# 初始化 schema（可幂等）
 # ----------------------
 DDL_STATEMENTS: list[str] = [
     # dpc_ingest_audit
@@ -160,12 +169,7 @@ DDL_STATEMENTS: list[str] = [
         finished_at TIMESTAMP
     );
     """,
-    # ⚠ 关键：必须是“唯一”，才能让 ON CONFLICT(run_id) 生效
-    "DO $$ BEGIN "
-    "    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'ux_feature_runs_run_id') THEN "
-    "        CREATE UNIQUE INDEX ux_feature_runs_run_id ON feature_runs(run_id); "
-    "    END IF; "
-    "END $$;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_feature_runs_run_id ON feature_runs(run_id);",
 
     # experiments（保留）
     """
@@ -181,6 +185,7 @@ DDL_STATEMENTS: list[str] = [
     """
 ]
 
+
 @router.post("/init-db", summary="Init DB schema")
 def init_db_stub(x_api_token: Optional[str] = Header(default=None, alias="X-API-Token")):
     _auth_or_401(x_api_token)
@@ -189,8 +194,9 @@ def init_db_stub(x_api_token: Optional[str] = Header(default=None, alias="X-API-
             conn.exec_driver_sql(sql)
     return {"ok": True, "msg": "schema initialized"}
 
+
 # ----------------------
-# feature-log (one)
+# 单条特征写入
 # ----------------------
 @router.post("/feature-log", summary="Log one tool feature")
 def feature_log(
@@ -230,8 +236,9 @@ def feature_log(
     finally:
         db.close()
 
+
 # ----------------------
-# feature-bulk-log
+# 批量特征写入
 # ----------------------
 @router.post("/feature-bulk-log", summary="Bulk log tool features")
 def feature_bulk_log(
@@ -289,8 +296,9 @@ def feature_bulk_log(
     finally:
         db.close()
 
+
 # ----------------------
-# feature-get
+# 查询特征
 # ----------------------
 @router.get("/feature-get", summary="Get tool features")
 def feature_get(
@@ -334,33 +342,67 @@ def feature_get(
     finally:
         db.close()
 
+
 # ----------------------
-# run-start / run-finish / run-get
+# 运行记录：开始 / 结束 / 查询
 # ----------------------
-@router.post("/run-start", summary="Start a feature run")
+@router.post("/run-start", summary="Start a feature run (robust)")
 def run_start(
     body: RunStartInput,
     x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
 ):
+    """
+    更稳健：优先 UPDATE；若不存在再 INSERT；最后 SELECT 返回。
+    避免 RETURNING / ON CONFLICT 带来的兼容性问题。
+    """
     _auth_or_401(x_api_token)
     db = SessionLocal()
     try:
-        row = db.execute(
+        # 1) 先尝试更新已存在的 run
+        res = db.execute(
             text("""
-                INSERT INTO feature_runs (run_id, tool, total, ok, fail, status, note)
-                VALUES (:run_id, :tool, 0, 0, 0, 'running', :note)
-                ON CONFLICT (run_id) DO UPDATE
-                SET tool = EXCLUDED.tool,
+                UPDATE feature_runs
+                SET tool = :tool,
                     status = 'running',
-                    note = EXCLUDED.note
-                RETURNING id, run_id, status
+                    note = :note
+                WHERE run_id = :run_id
             """),
             {"run_id": body.run_id, "tool": body.tool, "note": body.note},
-        ).mappings().first()
+        )
+        updated = res.rowcount or 0
+
+        # 2) 如无记录，再插入一条
+        if updated == 0:
+            db.execute(
+                text("""
+                    INSERT INTO feature_runs (run_id, tool, total, ok, fail, status, note)
+                    VALUES (:run_id, :tool, 0, 0, 0, 'running', :note)
+                """),
+                {"run_id": body.run_id, "tool": body.tool, "note": body.note},
+            )
+
         db.commit()
-        return {"ok": True, "item": dict(row) if row else {"run_id": body.run_id, "status": "running"}}
+
+        # 3) 读取并返回
+        row = db.execute(
+            text("""
+                SELECT id, run_id, tool, total, ok, fail, status, note,
+                       started_at, finished_at
+                FROM feature_runs
+                WHERE run_id = :run_id
+                ORDER BY id DESC
+                LIMIT 1
+            """),
+            {"run_id": body.run_id},
+        ).mappings().first()
+
+        return {
+            "ok": True,
+            "item": dict(row) if row else {"run_id": body.run_id, "status": "running"}
+        }
     finally:
         db.close()
+
 
 @router.post("/run-finish", summary="Finish a feature run")
 def run_finish(
@@ -390,6 +432,7 @@ def run_finish(
         return {"ok": True, "updated": r.rowcount}
     finally:
         db.close()
+
 
 @router.get("/run-get", summary="Get feature run")
 def run_get(
